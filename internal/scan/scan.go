@@ -98,6 +98,12 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 		}
 	}
 
+	setBar := func(label string, done, total int, suffix string) {
+		if st != nil {
+			st.Bar(label, done, total, suffix)
+		}
+	}
+
 	var warnings []string
 	resources := make(map[string]map[string]resourceRef)
 
@@ -119,7 +125,7 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 				continue
 			}
 			dashDone++
-			setStatus(fmt.Sprintf("dashboards %d/%d — %s", dashDone, dashTotal, truncate(item.Name, 50)))
+			setBar("dashboards", dashDone, dashTotal, truncate(item.Name, 50))
 			raw, err := client.FetchDashboard(ctx, item.ID)
 			if err != nil {
 				warnings = append(warnings, fmt.Sprintf("dashboard %s: %v", item.ID, err))
@@ -194,7 +200,7 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 	g, gctx := errgroup.WithContext(ctx)
 	sem := make(chan struct{}, opt.Workers)
 
-	setStatus(fmt.Sprintf("metrics 0/%d — fetching series…", metricsTotal))
+	setBar("metrics", 0, int(metricsTotal), "fetching series…")
 
 	for _, mname := range metricNames {
 		mname := mname
@@ -217,10 +223,7 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 					})
 					mu.Unlock()
 					done := metricsDone.Add(1)
-					setStatus(fmt.Sprintf(
-						"metrics %d/%d — series limit hit on %s (skipped)",
-						done, metricsTotal, truncate(mname, 40),
-					))
+					setBar("metrics", int(done), int(metricsTotal), "limit hit: "+truncate(mname, 30)+" (skipped)")
 					return nil
 				}
 				return err
@@ -237,10 +240,7 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 			mu.Unlock()
 
 			done := metricsDone.Add(1)
-			setStatus(fmt.Sprintf(
-				"metrics %d/%d — %d series — %s",
-				done, metricsTotal, seriesCount, truncate(mname, 40),
-			))
+			setBar("metrics", int(done), int(metricsTotal), fmt.Sprintf("%d series · %s", seriesCount, truncate(mname, 30)))
 			return nil
 		})
 	}
@@ -360,7 +360,7 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 				setStatus(fmt.Sprintf("fetching CX unit usage (%d UTC days)…", billingInclusiveDays))
 			}
 			raw, splitCounts, perMetricWarnings, err := opt.Billing.EnrichCatalog(ctx, catalogSeries, metricNames, startDay, endDay, opt.Workers, func(done, total int, metric string) {
-				setStatus(fmt.Sprintf("billing %d/%d — %s", done, total, truncate(metric, 40)))
+				setBar("billing", done, total, truncate(metric, 40))
 			})
 			for _, w := range perMetricWarnings {
 				warnings = append(warnings, "billing units: "+w)
