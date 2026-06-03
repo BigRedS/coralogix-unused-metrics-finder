@@ -57,6 +57,7 @@ If the API key has team-admin scope the tool first calls **`TeamService.ListTeam
 | **`metric_usage_unused_by_metric.csv`** | Same metric rollup as spreadsheet-friendly CSV. |
 | **`metric_usage_all_by_metric.csv`** | One row per **`__name__`** across **both** used and unused catalog series: `metric_name`, `series_count` (distinct catalog series), `unit_usage_sum` (summed CX billing over the window). |
 | **`metric_usage_otel_processors.yaml`** | Fragment for **otelcol-contrib**: drops metrics that are unused end-to-end, and strips label keys that appear only on unused series for partially-used metrics (see below). |
+| **`metric_usage_report.pdf`** | Printable summary of the run: scan settings, headline numbers, top unused metrics by cost, and step-by-step instructions for applying the OTEL fragment. Same content is derivable from the other files — provided as a single human-readable artefact to share. |
 
 ### CX billing window (**`unit_usage`** sample span)
 

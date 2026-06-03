@@ -13,6 +13,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/coralogix/coralogix-management-sdk/go v0.0.0-20240822133107-2f630415357f // indirect
 	github.com/dennwc/varint v1.0.0 // indirect
+	github.com/go-pdf/fpdf v0.9.0 // indirect
 	github.com/grafana/regexp v0.0.0-20240518133315-a468a5bfb3bc // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
