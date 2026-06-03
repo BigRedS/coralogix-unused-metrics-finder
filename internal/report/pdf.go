@@ -94,6 +94,9 @@ func writePDFScanSettings(pdf *fpdf.Fpdf, r *Report) {
 	if r.Meta.MetricsTruncatedAtSeriesLimit > 0 {
 		rows = append(rows, [2]string{"Metrics hit per-metric series cap", fmt.Sprintf("%d (catalog possibly incomplete)", r.Meta.MetricsTruncatedAtSeriesLimit)})
 	}
+	if r.Meta.SeriesFetchFailuresCount > 0 {
+		rows = append(rows, [2]string{"Metrics skipped (server series-analysis cap)", fmt.Sprintf("%d (usage status unknown)", r.Meta.SeriesFetchFailuresCount)})
+	}
 	if r.Meta.CoralogixInternalMetricNamesSkipped > 0 {
 		rows = append(rows, [2]string{"cx_* metrics skipped", fmt.Sprintf("%d", r.Meta.CoralogixInternalMetricNamesSkipped)})
 	}
@@ -105,6 +108,33 @@ func writePDFScanSettings(pdf *fpdf.Fpdf, r *Report) {
 		pdf.SetFont("Helvetica", "", 9)
 		for _, w := range r.Warnings {
 			pdf.MultiCell(pdfContentWidth, 5, pdfText("* "+w), "", "L", false)
+		}
+	}
+
+	if len(r.SeriesFetchFailures) > 0 {
+		pdf.Ln(2)
+		pdfSubHeading(pdf, fmt.Sprintf("Metrics excluded from analysis (%d)", len(r.SeriesFetchFailures)))
+		pdf.SetFont("Helvetica", "", 9)
+		pdf.MultiCell(pdfContentWidth, 5, pdfText(
+			"Coralogix refused to fetch the catalog for these metric names. They are not in the used/unused "+
+				"classification or the OTEL fragment — their usage is unknown, not confirmed unused. Re-run with "+
+				"a shorter --series-lookback-hours window to bring them under the server cap."),
+			"", "L", false)
+		limit := pdfTopRows
+		if limit > len(r.SeriesFetchFailures) {
+			limit = len(r.SeriesFetchFailures)
+		}
+		pdf.SetFont("Courier", "", 8)
+		for _, f := range r.SeriesFetchFailures[:limit] {
+			pdf.MultiCell(pdfContentWidth, 4, pdfText("  - "+f.MetricName), "", "L", false)
+		}
+		if remaining := len(r.SeriesFetchFailures) - limit; remaining > 0 {
+			pdf.SetFont("Helvetica", "I", 8)
+			pdf.SetTextColor(110, 110, 110)
+			pdf.MultiCell(pdfContentWidth, 4.5, pdfText(
+				fmt.Sprintf("  ... %d more - see series_fetch_failures in metric_usage_summary.json.", remaining)),
+				"", "L", false)
+			pdf.SetTextColor(0, 0, 0)
 		}
 	}
 	pdf.Ln(2)

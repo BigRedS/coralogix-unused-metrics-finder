@@ -8,10 +8,40 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/region"
 )
+
+// SeriesAnalysisLimitError is returned by FetchSeriesForMetric when Coralogix rejects the
+// /api/v1/series query with HTTP 422 ViolationTypeTotalSeriesAnalyzed — i.e. the metric has
+// more underlying time series than the server is willing to analyze in one call. Callers
+// can treat the affected metric as unanalyzable and continue with the rest of the scan.
+type SeriesAnalysisLimitError struct {
+	MetricName string
+	Cause      error
+}
+
+func (e *SeriesAnalysisLimitError) Error() string {
+	return fmt.Sprintf("series analysis limit exceeded for metric %q: %v", e.MetricName, e.Cause)
+}
+
+func (e *SeriesAnalysisLimitError) Unwrap() error { return e.Cause }
+
+// isSeriesAnalysisLimit detects the server-side per-query series cap from the error message
+// produced by c.get. The diagnostic body (included in the wrapped error) carries the
+// ViolationTypeTotalSeriesAnalyzed marker.
+func isSeriesAnalysisLimit(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	if strings.Contains(s, "ViolationTypeTotalSeriesAnalyzed") {
+		return true
+	}
+	return strings.Contains(s, "422") && strings.Contains(s, "series limit")
+}
 
 type Client struct {
 	APIHost     string
@@ -202,6 +232,9 @@ func (c *Client) FetchSeriesForMetric(ctx context.Context, metricName string, st
 	q.Set("limit", strconv.Itoa(limit))
 	body, err := c.get(ctx, u, q)
 	if err != nil {
+		if isSeriesAnalysisLimit(err) {
+			return nil, false, &SeriesAnalysisLimitError{MetricName: metricName, Cause: err}
+		}
 		return nil, false, err
 	}
 	var resp promAPIResponse

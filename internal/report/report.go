@@ -25,6 +25,16 @@ type Meta struct {
 	UsageBillingCalendarMonths          int    `json:"usage_billing_calendar_months,omitempty"` // >0 means window came from last N complete UTC months (not rolling days).
 	SeriesWithBillingData               int    `json:"series_with_billing_data,omitempty"`
 	UnusedSeriesWithBilling             int    `json:"unused_series_with_billing,omitempty"`
+	// SeriesFetchFailuresCount counts metric names whose /api/v1/series query was rejected
+	// by Coralogix (typically the server-side per-query series-analysis cap). Those metrics
+	// are absent from the catalog and therefore from used/unused/OTEL outputs.
+	SeriesFetchFailuresCount int `json:"series_fetch_failures_count,omitempty"`
+}
+
+// MetricSeriesFetchFailure records a metric whose catalog series fetch was rejected by Coralogix.
+type MetricSeriesFetchFailure struct {
+	MetricName string `json:"metric_name"`
+	Reason     string `json:"reason"`
 }
 
 type DashboardRef struct {
@@ -76,7 +86,11 @@ type Report struct {
 	ReferencedSelectorsWithoutMetricName               []SelectorRefIssue `json:"referenced_selectors_without_metric_name"`
 	ReferencedSelectorsMetricAbsentInTimeseriesWindow  []SelectorRefIssue `json:"referenced_selectors_metric_absent_in_timeseries_window"`
 	ReferencedSelectorsMetricPresentButNoSeriesMatches []SelectorRefIssue `json:"referenced_selectors_metric_present_but_no_series_matches"`
-	Warnings                                           []string           `json:"warnings"`
+	// SeriesFetchFailures lists metric names whose catalog could not be fetched (e.g. server-side
+	// series-analysis cap). These metrics are excluded from used/unused classification — their
+	// usage status is unknown rather than confirmed unused.
+	SeriesFetchFailures []MetricSeriesFetchFailure `json:"series_fetch_failures,omitempty"`
+	Warnings            []string                   `json:"warnings"`
 
 	// BillingSplitCountBySeries records how many catalog series shared one billing variation row (>1 → usage was divided).
 	BillingSplitCountBySeries map[string]int `json:"-"`
