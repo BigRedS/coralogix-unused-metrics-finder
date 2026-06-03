@@ -241,5 +241,12 @@ func (r *Report) Write(outputDir, filenamePrefix string) ([]string, error) {
 	}
 	written = append(written, otelName)
 
+	pdfName, pdfPath := join("metric_usage_report.pdf")
+	plan := BuildOTELProcessorPlan(r.UsedSeriesInCatalog, r.UnusedSeriesInCatalog)
+	if err := WritePDFReport(pdfPath, r, byMetric, plan, filenamePrefix); err != nil {
+		return nil, err
+	}
+	written = append(written, pdfName)
+
 	return written, nil
 }
