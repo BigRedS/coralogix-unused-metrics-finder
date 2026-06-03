@@ -68,7 +68,7 @@ func billingWindowUTC(now time.Time, lookbackDays, calendarMonths int) (startDay
 	return startDay, endDay, lookbackDays, nil
 }
 
-func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Report, error) {
+func Run(ctx context.Context, client Source, opt Options) (*report.Report, error) {
 	if opt.Workers <= 0 {
 		opt.Workers = 8
 	}
@@ -424,7 +424,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 
 	return &report.Report{
 		Meta: report.Meta{
-			APIHost:                             client.APIHost,
+			APIHost:                             client.Host(),
 			SeriesLookbackSeconds:               int(opt.SeriesLookback.Seconds()),
 			SeriesLimitPerMetric:                opt.SeriesLimitPerMetric,
 			DashboardsScanned:                   len(dashboards),

@@ -40,6 +40,25 @@ see `webui/README.md` for more info.
 
 If your API key lacks **Dashboards**, **Alerts**, or **SLO** access, pass **`--skip-dashboards`**, **`--skip-alerts`**, and/or **`--skip-slo`** so the scan skips those HTTP calls. Correlation (used vs unused, OTEL drops/strips) then considers only PromQL from the sources that ran; skipped modes append **`warnings`** in `metric_usage_summary.json`. Skipping **all three** makes every catalog series appear unused.
 
+### Run via the `cx` CLI (OAuth, no API key)
+
+Instead of `--region` + `--key`, pass **`--profile <name>`** to fetch dashboards, alerts, SLOs and metrics through the [`cx` CLI](https://github.com/coralogix/cx) using its OAuth profiles (`~/.cx/profiles/*.toml`, credentials in the OS keychain). No API key is required.
+
+```bash
+cx profiles add my-team        # one-time OAuth login
+./bin/coralogix-unused-metrics-finder --profile my-team --output-dir ./out
+```
+
+The `cx` binary must be on `PATH`. Each `cx` invocation is bounded by `--timeout-sec` (default 120s); a metric whose series query exceeds it is recorded as unanalyzable and skipped.
+
+**Billing is hybrid.** The CLI has no per-metric usage surface, so cost columns (`unit_usage`, `bytes_volume`, cardinality, `$` savings) are blank in profile mode **unless** you also pass **`--key`** (and **`--region`**); the tool then runs the gRPC Metrics Usage path for cost data while everything else goes through the CLI.
+
+**Limitations in CLI mode:**
+- `cx metrics search` has no time-window filter, so the metric-name list isn't window-scoped the way the direct API is.
+- Series are enumerated with `cx metrics query-range` over the lookback window (no native `/api/v1/series`); very high-cardinality metrics can be slow/memory-heavy on large tenants and may be skipped via the timeout.
+- `cx dashboards catalog` is broken on some tenants and returns an empty list — dashboard correlation is then skipped for that run.
+- Team-name filename prefixing (gRPC) is skipped without a `--key`.
+
 
 ---
 

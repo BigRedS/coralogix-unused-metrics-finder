@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/coralogix"
+	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/cxcli"
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/cxteams"
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/metricusage"
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/region"
@@ -94,6 +95,7 @@ func main() {
 func run() int {
 	regionFlag := flag.String("region", "", "Coralogix region or domain (eu1, eu2.coralogix.com, api.eu2.coralogix.com, …)")
 	keyFlag := flag.String("key", "", "Coralogix API key (Bearer)")
+	profileFlag := flag.String("profile", "", "cx CLI profile name (OAuth login). When set, dashboards/alerts/SLOs/metrics are fetched via the `cx` CLI and --key becomes optional. Billing requires --key (+ --region); without it cost columns are blank. Metric-name window filtering is unavailable in CLI mode.")
 	outputDir := flag.String("output-dir", ".", "directory for report outputs (JSON, CSV per-series + per-metric rollup, OTEL YAML)")
 	lookbackHours := flag.Float64("series-lookback-hours", 25, "time window for Prometheus series discovery")
 	seriesLimit := flag.Int("series-limit-per-metric", 50_000, "max series rows per metric name")
@@ -109,7 +111,7 @@ func run() int {
 	debugBillingMetric := flag.String("debug-billing-metric", "", "if set, dump the raw GetVariationUsagesByMetric response for this metric over --usage-lookback-days and exit (skips the full scan)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags]\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Required flags: --region and --key\n\n")
+		fmt.Fprintf(os.Stderr, "Required flags: --region and --key, OR --profile (cx CLI / OAuth)\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -119,28 +121,55 @@ func run() int {
 		return 2
 	}
 
-	if *regionFlag == "" || *keyFlag == "" {
+	cliMode := *profileFlag != ""
+	if !cliMode && (*regionFlag == "" || *keyFlag == "") {
 		flag.Usage()
 		return 2
 	}
 
-	apiHost, err := region.ResolveAPIHost(*regionFlag)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
+	// apiHost is needed for the API client and for the gRPC billing/teams paths.
+	// In CLI mode it is optional (only required if billing via --key is wanted).
+	var apiHost string
+	if *regionFlag != "" {
+		var err error
+		apiHost, err = region.ResolveAPIHost(*regionFlag)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
 	}
 
-	client := coralogix.NewClient(apiHost, *keyFlag, time.Duration(*timeoutSec)*time.Second)
 	ctx := context.Background()
 
-	var billingClient *metricusage.Client
-	if !*skipBilling && (*usageDays > 0 || *usageMonths > 0) {
-		billingClient, err = metricusage.NewClient(apiHost, *keyFlag)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "billing client:", err)
-			return 1
+	var client scan.Source
+	if cliMode {
+		opts := []cxcli.Option{
+			cxcli.WithStep(time.Duration(*lookbackHours * float64(time.Hour))),
+			cxcli.WithTimeout(time.Duration(*timeoutSec) * time.Second),
 		}
-		defer billingClient.Close()
+		if apiHost != "" {
+			opts = append(opts, cxcli.WithHost(apiHost))
+		}
+		client = cxcli.NewClient(*profileFlag, opts...)
+	} else {
+		client = coralogix.NewClient(apiHost, *keyFlag, time.Duration(*timeoutSec)*time.Second)
+	}
+
+	// Billing uses the gRPC Metrics Usage API, which needs an API key and host.
+	// It runs whenever a key is present (always in API mode; opt-in for CLI mode).
+	var billingClient *metricusage.Client
+	if !*skipBilling && (*usageDays > 0 || *usageMonths > 0) && *keyFlag != "" {
+		if apiHost == "" {
+			fmt.Fprintln(os.Stderr, "billing requires --region alongside --key; skipping billing (cost columns will be blank)")
+		} else {
+			var err error
+			billingClient, err = metricusage.NewClient(apiHost, *keyFlag)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "billing client:", err)
+				return 1
+			}
+			defer billingClient.Close()
+		}
 	}
 
 	if *debugBillingMetric != "" {
@@ -168,7 +197,12 @@ func run() int {
 		return 1
 	}
 
-	teamPrefix := resolveTeamFilenamePrefix(ctx, apiHost, *keyFlag)
+	// Team-name lookup uses the gRPC Teams API (needs key + host); skip it in
+	// CLI mode without a key and fall back to unprefixed filenames.
+	teamPrefix := ""
+	if apiHost != "" && *keyFlag != "" {
+		teamPrefix = resolveTeamFilenamePrefix(ctx, apiHost, *keyFlag)
+	}
 	if teamPrefix != "" {
 		fmt.Fprintf(os.Stderr, "Using team-name prefix %q on output files.\n", teamPrefix)
 	}
