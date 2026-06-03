@@ -3,6 +3,7 @@ package scan
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -186,6 +187,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 	var mu sync.Mutex
 	catalogSeries := make(map[string]map[string]string)
 	truncatedCount := 0
+	var seriesFetchFailures []report.MetricSeriesFetchFailure
 	metricsTotal := int64(len(metricNames))
 	var metricsDone atomic.Int64
 
@@ -206,6 +208,21 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 
 			series, trunc, err := client.FetchSeriesForMetric(gctx, mname, start, now, opt.SeriesLimitPerMetric)
 			if err != nil {
+				var limitErr *coralogix.SeriesAnalysisLimitError
+				if errors.As(err, &limitErr) {
+					mu.Lock()
+					seriesFetchFailures = append(seriesFetchFailures, report.MetricSeriesFetchFailure{
+						MetricName: mname,
+						Reason:     "Coralogix rejected /api/v1/series with ViolationTypeTotalSeriesAnalyzed — this metric has more time series in the lookback window than the server will analyze in one query. Reduce --series-lookback-hours or treat this metric as unanalyzable.",
+					})
+					mu.Unlock()
+					done := metricsDone.Add(1)
+					setStatus(fmt.Sprintf(
+						"metrics %d/%d — series limit hit on %s (skipped)",
+						done, metricsTotal, truncate(mname, 40),
+					))
+					return nil
+				}
 				return err
 			}
 			mu.Lock()
@@ -229,6 +246,13 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 	}
 	if err := g.Wait(); err != nil {
 		return nil, err
+	}
+
+	if len(seriesFetchFailures) > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"%d metric name(s) skipped because Coralogix refused to analyze that many series in one query — see series_fetch_failures for the list. These metrics are excluded from used/unused classification and the OTEL fragment; their usage status is unknown, not unused.",
+			len(seriesFetchFailures),
+		))
 	}
 
 	setStatus("correlating selectors with catalog…")
@@ -416,6 +440,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 			UsageBillingCalendarMonths:          billingCalMonths,
 			SeriesWithBillingData:               len(billingBySeries),
 			UnusedSeriesWithBilling:             unusedWithBilling,
+			SeriesFetchFailuresCount:            len(seriesFetchFailures),
 		},
 		Dashboards:                           dashboards,
 		UsedSeriesInCatalog:                  used,
@@ -423,8 +448,9 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 		ReferencedSelectorsWithoutMetricName: noMetricName,
 		ReferencedSelectorsMetricAbsentInTimeseriesWindow:  metricAbsent,
 		ReferencedSelectorsMetricPresentButNoSeriesMatches: noLabelMatch,
-		Warnings:                  warnings,
-		BillingSplitCountBySeries: billingSplitBySeries,
+		SeriesFetchFailures:                                seriesFetchFailures,
+		Warnings:                                           warnings,
+		BillingSplitCountBySeries:                          billingSplitBySeries,
 	}, nil
 }
 

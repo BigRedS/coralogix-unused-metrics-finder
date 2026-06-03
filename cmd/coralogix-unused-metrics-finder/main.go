@@ -203,6 +203,12 @@ func run() int {
 			m.MetricsTruncatedAtSeriesLimit,
 		)
 	}
+	if m.SeriesFetchFailuresCount > 0 {
+		fmt.Fprintf(os.Stderr,
+			"Warning: %d metric(s) skipped — Coralogix refused to analyze that many series in one query; see series_fetch_failures in metric_usage_summary.json. Their usage status is unknown (not 'unused') and they are excluded from the OTEL fragment.\n",
+			m.SeriesFetchFailuresCount,
+		)
+	}
 	if *skipDashboards || *skipAlerts || *skipSLO {
 		var skipped []string
 		if *skipDashboards {
