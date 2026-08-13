@@ -12,6 +12,7 @@ import (
 
 	metriccommon "github.com/BigRedS/coralogix-unused-metrics-finder/internal/gen/metriccommon"
 	metricusages "github.com/BigRedS/coralogix-unused-metrics-finder/internal/gen/metricusages"
+	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/region"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/genproto/googleapis/type/date"
 	"google.golang.org/grpc"
@@ -27,16 +28,21 @@ type UnitsUsage struct {
 	DaysInRange int     `json:"days_in_range"`
 }
 
-// Client calls UsageService on api.<region>:443.
+// Client calls UsageService on the regional gRPC endpoint (ng-api-grpc.<domain>:443).
 type Client struct {
-	APIHost string
-	svc     metricusages.UsageServiceClient
-	conn    *grpc.ClientConn
+	// GRPCHost is the host actually dialled, after mapping — worth having in diagnostics,
+	// since it is deliberately not the REST API host.
+	GRPCHost string
+	svc      metricusages.UsageServiceClient
+	conn     *grpc.ClientConn
 }
 
-// NewClient dials the regional Coralogix API host (e.g. api.eu2.coralogix.com).
-func NewClient(apiHost, apiKey string) (*Client, error) {
-	target := apiHost + ":443"
+// NewClient dials the Coralogix gRPC endpoint for host. Pass either the account's API host
+// (api.eu2.coralogix.com) or an explicit gRPC host; region.GRPCHost normalises both, and the
+// REST host is never dialled directly — see its doc comment for why that matters.
+func NewClient(host, apiKey string) (*Client, error) {
+	grpcHost := region.GRPCHost(host)
+	target := grpcHost + ":443"
 	conn, err := grpc.NewClient(
 		target,
 		grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")),
@@ -46,9 +52,9 @@ func NewClient(apiHost, apiKey string) (*Client, error) {
 		return nil, fmt.Errorf("grpc dial %s: %w", target, err)
 	}
 	return &Client{
-		APIHost: apiHost,
-		svc:     metricusages.NewUsageServiceClient(conn),
-		conn:    conn,
+		GRPCHost: grpcHost,
+		svc:      metricusages.NewUsageServiceClient(conn),
+		conn:     conn,
 	}, nil
 }
 

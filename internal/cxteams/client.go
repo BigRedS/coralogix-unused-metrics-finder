@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	cxteamspb "github.com/BigRedS/coralogix-unused-metrics-finder/internal/gen/cxteams"
+	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/region"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -21,8 +22,11 @@ type Client struct {
 	conn *grpc.ClientConn
 }
 
-func NewClient(apiHost, apiKey string) (*Client, error) {
-	target := apiHost + ":443"
+// NewClient dials the Coralogix gRPC endpoint for host. Pass either the account's API host
+// (api.eu2.coralogix.com) or an explicit gRPC host; region.GRPCHost normalises both. The REST
+// API host is not a gRPC endpoint — see region.GRPCHost for why.
+func NewClient(host, apiKey string) (*Client, error) {
+	target := region.GRPCHost(host) + ":443"
 	conn, err := grpc.NewClient(
 		target,
 		grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")),

@@ -165,7 +165,7 @@ func (reg *registry) runScan(j *job, apiHost, apiKey string) {
 	ctx := context.Background()
 	client := coralogix.NewClient(apiHost, apiKey, 120*time.Second)
 
-	billingClient, err := metricusage.NewClient(apiHost, apiKey)
+	billingClient, err := metricusage.NewClient(region.GRPCHost(apiHost), apiKey)
 	if err != nil {
 		j.fail(fmt.Errorf("billing client: %w", err))
 		_ = os.RemoveAll(dir)
@@ -190,7 +190,7 @@ func (reg *registry) runScan(j *job, apiHost, apiKey string) {
 		_ = os.RemoveAll(dir)
 		return
 	}
-	teamPrefix := resolveTeamFilenamePrefix(ctx, apiHost, apiKey)
+	teamPrefix := resolveTeamFilenamePrefix(ctx, region.GRPCHost(apiHost), apiKey)
 	written, err := rep.Write(dir, teamPrefix)
 	if err != nil {
 		j.fail(fmt.Errorf("write: %w", err))
@@ -203,8 +203,8 @@ func (reg *registry) runScan(j *job, apiHost, apiKey string) {
 
 // resolveTeamFilenamePrefix mirrors the CLI behavior: try ListTeams, return a sanitized
 // prefix, fall back to empty string on any failure so the scan still produces output.
-func resolveTeamFilenamePrefix(ctx context.Context, apiHost, apiKey string) string {
-	tc, err := cxteams.NewClient(apiHost, apiKey)
+func resolveTeamFilenamePrefix(ctx context.Context, grpcHost, apiKey string) string {
+	tc, err := cxteams.NewClient(grpcHost, apiKey)
 	if err != nil {
 		return ""
 	}

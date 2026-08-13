@@ -22,8 +22,8 @@ import (
 // the API key and returns a filesystem-safe prefix to prepend to output files. Any
 // failure (PermissionDenied, network, empty response) yields "" so the caller falls
 // back to unprefixed filenames — team-name lookup is a nice-to-have, not required.
-func resolveTeamFilenamePrefix(ctx context.Context, apiHost, apiKey string) string {
-	tc, err := cxteams.NewClient(apiHost, apiKey)
+func resolveTeamFilenamePrefix(ctx context.Context, grpcHost, apiKey string) string {
+	tc, err := cxteams.NewClient(grpcHost, apiKey)
 	if err != nil {
 		return ""
 	}
@@ -100,6 +100,7 @@ func run() int {
 	seriesLimit := flag.Int("series-limit-per-metric", 50_000, "max series rows per metric name")
 	workers := flag.Int("workers", 8, "parallel series fetches")
 	timeoutSec := flag.Int("timeout-sec", 120, "HTTP client timeout per request")
+	grpcHostFlag := flag.String("grpc-host", "", "override the gRPC endpoint for billing and team lookup (default: ng-api-grpc.<domain> derived from --region)")
 	usageDays := flag.Int("usage-lookback-days", 7, "rolling inclusive UTC calendar days ending today for CX unit_usage (0 skips rolling window; use --usage-billing-calendar-months instead)")
 	usageMonths := flag.Int("usage-billing-calendar-months", 0, "if >0, CX unit_usage window is the last N complete UTC calendar months (overrides rolling days when both set); 0 uses rolling days only")
 	skipBilling := flag.Bool("skip-billing", false, "skip Metrics Usage API (no unit_usage on output)")
@@ -131,12 +132,19 @@ func run() int {
 		return 2
 	}
 
+	// Billing and team lookup are gRPC, which lives on a different host from the REST API —
+	// region.GRPCHost explains why the REST host cannot be used.
+	grpcHost := region.GRPCHost(apiHost)
+	if *grpcHostFlag != "" {
+		grpcHost = *grpcHostFlag
+	}
+
 	client := coralogix.NewClient(apiHost, *keyFlag, time.Duration(*timeoutSec)*time.Second)
 	ctx := context.Background()
 
 	var billingClient *metricusage.Client
 	if !*skipBilling && (*usageDays > 0 || *usageMonths > 0) {
-		billingClient, err = metricusage.NewClient(apiHost, *keyFlag)
+		billingClient, err = metricusage.NewClient(grpcHost, *keyFlag)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "billing client:", err)
 			return 1
@@ -169,7 +177,7 @@ func run() int {
 		return 1
 	}
 
-	teamPrefix := resolveTeamFilenamePrefix(ctx, apiHost, *keyFlag)
+	teamPrefix := resolveTeamFilenamePrefix(ctx, grpcHost, *keyFlag)
 	if teamPrefix != "" {
 		fmt.Fprintf(os.Stderr, "Using team-name prefix %q on output files.\n", teamPrefix)
 	}
