@@ -19,6 +19,7 @@ import (
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/promqlextract"
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/report"
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/status"
+	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/strintern"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -189,6 +190,10 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 
 	var mu sync.Mutex
 	catalogSeries := make(map[string]map[string]string)
+	// Label names and values repeat across nearly every series; json decoding allocates a fresh
+	// copy of each per series. Interning them is what keeps a multi-million-series catalog inside
+	// available memory — without it the retained label strings dominate the scan's heap.
+	labels := strintern.New()
 	truncatedCount := 0
 	var seriesFetchFailures []report.MetricSeriesFetchFailure
 	metricsTotal := int64(len(metricNames))
@@ -229,6 +234,12 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 				))
 				return nil
 			}
+			// Intern outside the catalog lock: the table has its own (sharded) locking, and
+			// this is the expensive part of absorbing a metric's series.
+			for i, lbls := range series {
+				series[i] = labels.Labels(lbls)
+			}
+
 			mu.Lock()
 			if trunc {
 				truncatedCount++
@@ -251,6 +262,13 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
+
+	// The catalog now holds the only references it needs; the intern table's own entries (~50
+	// bytes per distinct string) are pure overhead from here on. Record its size and drop it so
+	// the GC can reclaim the table before the memory-hungry correlation and output phases.
+	labelStringsRetained := labels.Len()
+	labels = nil
+	_ = labels // released deliberately: see above
 
 	// Failures arrive from parallel workers; sort so report output is stable across runs.
 	sort.Slice(seriesFetchFailures, func(i, j int) bool {
@@ -461,6 +479,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 			UnusedSeriesWithBilling:             unusedWithBilling,
 			SeriesFetchFailuresCount:            len(seriesFetchFailures),
 			SeriesFetchTimeoutsCount:            seriesFetchTimeouts,
+			DistinctLabelStringsRetained:        labelStringsRetained,
 		},
 		Dashboards:                           dashboards,
 		UsedSeriesInCatalog:                  used,

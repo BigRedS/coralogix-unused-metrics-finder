@@ -1,7 +1,6 @@
 package report
 
 import (
-	"encoding/json"
 	"os"
 	"sort"
 	"strconv"
@@ -34,6 +33,10 @@ type Meta struct {
 	// SeriesFetchTimeoutsCount is the subset of SeriesFetchFailuresCount that timed out rather
 	// than being refused outright. A higher --timeout-sec or shorter lookback may recover them.
 	SeriesFetchTimeoutsCount int `json:"series_fetch_timeouts_count,omitempty"`
+	// DistinctLabelStringsRetained is how many distinct label names and values the catalog holds
+	// after interning. Compare with distinct_series_in_catalog to judge the scan's memory needs:
+	// the catalog retains one copy of each of these, not one per series.
+	DistinctLabelStringsRetained int `json:"distinct_label_strings_retained,omitempty"`
 }
 
 // Series fetch failure categories (MetricSeriesFetchFailure.Category).
@@ -232,21 +235,13 @@ func (r *Report) Write(outputDir, filenamePrefix string) ([]string, error) {
 	var written []string
 
 	summaryName, summaryPath := join("metric_usage_summary.json")
-	summary, err := json.MarshalIndent(r, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(summaryPath, summary, 0o644); err != nil {
+	if err := writeSummaryJSON(summaryPath, r); err != nil {
 		return nil, err
 	}
 	written = append(written, summaryName)
 
 	unusedName, unusedPath := join("metric_usage_unused_series.json")
-	unused, err := json.MarshalIndent(r.UnusedSeriesInCatalog, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(unusedPath, unused, 0o644); err != nil {
+	if err := writeJSONArrayFile(unusedPath, r.UnusedSeriesInCatalog); err != nil {
 		return nil, err
 	}
 	written = append(written, unusedName)
@@ -262,11 +257,7 @@ func (r *Report) Write(outputDir, filenamePrefix string) ([]string, error) {
 	costRows := unusedRowsFromSeries(unusedByCost, splitN)
 
 	byCostName, byCostPath := join("metric_usage_unused_by_cost.json")
-	byCost, err := json.MarshalIndent(costRows, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(byCostPath, byCost, 0o644); err != nil {
+	if err := writeJSONArrayFile(byCostPath, costRows); err != nil {
 		return nil, err
 	}
 	written = append(written, byCostName)
@@ -279,11 +270,7 @@ func (r *Report) Write(outputDir, filenamePrefix string) ([]string, error) {
 
 	byMetric := AggregateUnusedByMetric(costRows)
 	byMetricName, byMetricPath := join("metric_usage_unused_by_metric.json")
-	byMetricJSON, err := json.MarshalIndent(byMetric, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(byMetricPath, byMetricJSON, 0o644); err != nil {
+	if err := writeJSONArrayFile(byMetricPath, byMetric); err != nil {
 		return nil, err
 	}
 	written = append(written, byMetricName)
