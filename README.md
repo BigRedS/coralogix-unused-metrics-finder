@@ -53,6 +53,17 @@ Such metrics are **excluded from used/unused classification and from the OTEL fr
 
 Two things still fail the run, so a broken scan never masquerades as "everything is unused": statuses that mean the *request* was rejected rather than the metric (`400`, `401`, `402`, `403`, `404`, `405` — bad key, missing permission, wrong region), and more than **half** the metric names failing, whatever the reason.
 
+### Memory use on large accounts
+
+The scan holds the whole series catalog in memory while it correlates, so peak memory scales with **distinct series**, not metric names. Roughly **0.5–1.5 KB per series** after interning (wider label sets cost more), so a 3M-series account needs a few GB. On a memory-pressured machine the process can be killed outright — on macOS that appears as `Killed: 9` with no Go panic. `/usr/bin/time -l` reports the actual peak (`maximum resident set size`).
+
+Two things keep it as low as it is, both worth knowing before changing them:
+
+- Label names and values are **interned** — one retained copy each, rather than one per series (`meta.distinct_label_strings_retained` reports how many distinct strings the catalog holds). Worth ~30% of catalog memory.
+- The JSON outputs are **streamed row by row** rather than built with `json.MarshalIndent`, which would hold the whole document — twice — before writing. Worth ~4× on the peak of the output phase. `internal/report/jsonstream.go` produces byte-identical output to the encoder; a test pins that.
+
+If a scan still won't fit, reduce **`--series-lookback-hours`** (fewer series in the window) or **`--workers`** (fewer concurrent responses being decoded).
+
 If your API key lacks **Dashboards**, **Alerts**, or **SLO** access, pass **`--skip-dashboards`**, **`--skip-alerts`**, and/or **`--skip-slo`** so the scan skips those HTTP calls. Correlation (used vs unused, OTEL drops/strips) then considers only PromQL from the sources that ran; skipped modes append **`warnings`** in `metric_usage_summary.json`. Skipping **all three** makes every catalog series appear unused.
 
 
