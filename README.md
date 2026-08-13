@@ -28,7 +28,7 @@ go build -o bin/coralogix-unused-metrics-finder ./cmd/coralogix-unused-metrics-f
 
 Cost data is **opt-in**: add **`--billing`** for `unit_usage` figures and the cost-ranked outputs (see [CX billing is opt-in](#cx-billing-is-opt-in---billing)).
 
-See `--help` for flags (`--billing`, `--usage-lookback-days`, `--usage-billing-calendar-months`, `--grpc-host`, `--skip-dashboards`, `--skip-alerts`, `--skip-slo`, etc.).
+See `--help` for flags (`--billing`, `--billing-allow-partial`, `--usage-lookback-days`, `--usage-billing-calendar-months`, `--grpc-host`, `--skip-dashboards`, `--skip-alerts`, `--skip-slo`, etc.).
 
 ### Browser UI
 
@@ -121,6 +121,12 @@ Without `--billing` you still get the whole point of the tool: which series are 
 When there is no billing data — `--billing` not given, or the lookup returned nothing — the two cost files are **not written at all** (with every cost column empty, the "by cost" order degrades to the series name and they become bulky duplicates of `metric_usage_unused_series.json`), and the PDF prints `not collected` / `unavailable` in place of cost figures rather than a `0` that would read as measured. The reason appears in `warnings` in `metric_usage_summary.json` either way.
 
 **`--skip-billing`** is retained but no longer needed: it forces billing off, which is now the default.
+
+#### Billing coverage
+
+Billing is fetched with one call per metric name, and some of those calls can fail while others succeed. That matters more than it sounds: **a metric whose lookup failed contributes no usage, so it looks free** — it sinks to the bottom of every cost ranking and the totals understate reality, while the output still reads like a complete answer.
+
+So coverage is measured (`meta.billing_metric_lookups_attempted` / `_succeeded`) and enforced: at least **90%** of lookups must succeed before cost figures are reported. Below that, cost figures and the cost-ranked files are **withheld**, with the coverage and the reason in `warnings` and in the PDF. Pass **`--billing-allow-partial`** to get them anyway — they are then labelled as a **lower bound** in the PDF and `meta.billing_partial_accepted` records the choice.
 
 The window flags below apply **only** with `--billing`:
 
