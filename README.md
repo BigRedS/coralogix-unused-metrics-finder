@@ -79,6 +79,18 @@ Two things keep it as low as it is, both worth knowing before changing them:
 
 If a scan still won't fit, reduce **`--series-lookback-hours`** (fewer series in the window) or **`--workers`** (fewer concurrent responses being decoded).
 
+### Warnings are folded, not repeated
+
+Steps that loop over many items — one request per dashboard, one billing lookup per metric — used to emit one warning per failed item, so a single root cause (a dead connection, an expired key) produced thousands of copies of the same paragraph. Warnings sharing a summary line are now folded into one entry that names the cause once and lists the affected subjects:
+
+```
+billing lookup failed for 1,204 metrics, all with the same error: rpc error: code = Unavailable
+desc = connection error: … missing selected ALPN property — affected: "FE_amount_cx_count",
+"a_metric", … (+1,199 more)
+```
+
+A failure affecting a single item keeps its full detail, including the HTTP replication block, since that detail is the diagnostic.
+
 If your API key lacks **Dashboards**, **Alerts**, or **SLO** access, pass **`--skip-dashboards`**, **`--skip-alerts`**, and/or **`--skip-slo`** so the scan skips those HTTP calls. Correlation (used vs unused, OTEL drops/strips) then considers only PromQL from the sources that ran; skipped modes append **`warnings`** in `metric_usage_summary.json`. Skipping **all three** makes every catalog series appear unused.
 
 
