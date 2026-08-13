@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -102,13 +101,13 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 		}
 	}
 
-	var warnings []string
+	warnings := newWarningSet()
 	resources := make(map[string]map[string]resourceRef)
 
 	var dashboards []report.DashboardRef
 	resources["dashboard"] = make(map[string]resourceRef)
 	if opt.SkipDashboards {
-		warnings = append(warnings, "skipped dashboards (--skip-dashboards); correlation excludes dashboard PromQL")
+		warnings.Add("skipped dashboards (--skip-dashboards); correlation excludes dashboard PromQL")
 	} else {
 		setStatus("listing dashboard catalog…")
 		catalog, err := client.FetchDashboardCatalog(ctx)
@@ -126,7 +125,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 			setStatus(fmt.Sprintf("dashboards %d/%d — %s", dashDone, dashTotal, truncate(item.Name, 50)))
 			raw, err := client.FetchDashboard(ctx, item.ID)
 			if err != nil {
-				warnings = append(warnings, fmt.Sprintf("dashboard %s: %v", item.ID, err))
+				warnings.AddFor("dashboard fetch failed", "dashboard", item.ID, err.Error())
 				continue
 			}
 			resources["dashboard"][item.ID] = resourceRef{selectors: promqlextract.ExtractFromJSON(raw)}
@@ -137,7 +136,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 	var alerts []json.RawMessage
 	resources["alert"] = make(map[string]resourceRef)
 	if opt.SkipAlerts {
-		warnings = append(warnings, "skipped alerts (--skip-alerts); correlation excludes alert PromQL")
+		warnings.Add("skipped alerts (--skip-alerts); correlation excludes alert PromQL")
 	} else {
 		setStatus("fetching alert definitions…")
 		var err error
@@ -158,7 +157,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 	var slos []json.RawMessage
 	resources["slo"] = make(map[string]resourceRef)
 	if opt.SkipSLOs {
-		warnings = append(warnings, "skipped SLOs (--skip-slo); correlation excludes SLO PromQL")
+		warnings.Add("skipped SLOs (--skip-slo); correlation excludes SLO PromQL")
 	} else {
 		setStatus("fetching SLOs…")
 		var err error
@@ -177,7 +176,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 	}
 
 	if opt.SkipDashboards && opt.SkipAlerts && opt.SkipSLOs {
-		warnings = append(warnings, "all correlation sources skipped; every catalog series will appear unused")
+		warnings.Add("all correlation sources skipped; every catalog series will appear unused")
 	}
 
 	// Metric catalog (parallel series fetch per metric name)
@@ -286,10 +285,10 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 				seriesFetchFailures[0].MetricName,
 			)
 		}
-		warnings = append(warnings, fmt.Sprintf(
+		warnings.Add(
 			"%d of %d metric name(s) skipped because their series catalog could not be retrieved (%s) — see series_fetch_failures for the list and per-metric reasons. These metrics are excluded from used/unused classification and the OTEL fragment; their usage status is unknown, not unused.",
 			len(seriesFetchFailures), len(metricNames), report.SeriesFetchFailureBreakdown(seriesFetchFailures),
-		))
+		)
 	}
 
 	setStatus("correlating selectors with catalog…")
@@ -384,12 +383,12 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 
 	billingEnabled := opt.Billing != nil && (opt.UsageLookbackDays > 0 || opt.UsageBillingCalendarMonths > 0)
 	if !billingEnabled {
-		warnings = append(warnings, "CX billing data not collected (--billing off): no unit_usage, bytes_volume or sample_count figures anywhere in this report, and no cost-ranked outputs. Which series are unused is unaffected — only their cost is unknown.")
+		warnings.Add("CX billing data not collected (--billing off): no unit_usage, bytes_volume or sample_count figures anywhere in this report, and no cost-ranked outputs. Which series are unused is unaffected — only their cost is unknown.")
 	}
 	if billingEnabled {
 		startDay, endDay, inclDays, winErr := billingWindowUTC(time.Now(), opt.UsageLookbackDays, opt.UsageBillingCalendarMonths)
 		if winErr != nil {
-			warnings = append(warnings, "billing window: "+winErr.Error())
+			warnings.Add("billing window: %s", winErr.Error())
 		} else {
 			billingStartStr = startDay.Format("2006-01-02")
 			billingEndStr = endDay.Format("2006-01-02")
@@ -399,22 +398,24 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 			} else {
 				setStatus(fmt.Sprintf("fetching CX unit usage (%d UTC days)…", billingInclusiveDays))
 			}
-			raw, splitCounts, perMetricWarnings, err := opt.Billing.EnrichCatalog(ctx, catalogSeries, metricNames, startDay, endDay, opt.Workers, func(done, total int, metric string) {
+			raw, splitCounts, failures, err := opt.Billing.EnrichCatalog(ctx, catalogSeries, metricNames, startDay, endDay, opt.Workers, func(done, total int, metric string) {
 				setStatus(fmt.Sprintf("billing %d/%d — %s", done, total, truncate(metric, 40)))
 			})
-			for _, w := range perMetricWarnings {
-				warnings = append(warnings, "billing units: "+w)
-			}
 			if err != nil {
-				warnings = append(warnings, "billing units: "+err.Error())
+				warnings.Add("billing units: %s", err.Error())
 			} else {
+				// One warning per failed metric would repeat the same message thousands of times
+				// when the cause is the connection rather than the metric; AddFor folds them.
+				for _, f := range failures {
+					warnings.AddFor("billing lookup failed", "metric", f.MetricName, f.Err.Error())
+				}
 				for k, u := range raw {
 					billingBySeries[k] = toReportBilling(u)
 				}
 				billingSplitBySeries = splitCounts
 			}
 			if len(billingBySeries) == 0 {
-				warnings = append(warnings, "CX billing was requested but returned no usable data: no unit_usage, bytes_volume or sample_count figures anywhere in this report, and no cost-ranked outputs. Cost figures are missing, not zero. Which series are unused is unaffected.")
+				warnings.Add("CX billing was requested but returned no usable data: no unit_usage, bytes_volume or sample_count figures anywhere in this report, and no cost-ranked outputs. Cost figures are missing, not zero. Which series are unused is unaffected.")
 			}
 		}
 	}
@@ -494,7 +495,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 		ReferencedSelectorsMetricAbsentInTimeseriesWindow:  metricAbsent,
 		ReferencedSelectorsMetricPresentButNoSeriesMatches: noLabelMatch,
 		SeriesFetchFailures:       seriesFetchFailures,
-		Warnings:                  warnings,
+		Warnings:                  warnings.List(),
 		BillingSplitCountBySeries: billingSplitBySeries,
 	}, nil
 }
@@ -568,17 +569,13 @@ func truncate(s string, max int) string {
 	return s[:max-1] + "…"
 }
 
-// firstLine reduces an error to its leading line, trimmed — client errors carry a multi-line
-// curl replication block that would otherwise bloat every failure Reason in the report.
+// firstLine reduces an error to its leading line — client errors carry a multi-line curl
+// replication block that would otherwise bloat every failure Reason in the report.
 func firstLine(err error) string {
 	if err == nil {
 		return ""
 	}
-	s := err.Error()
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		s = s[:i]
-	}
-	return truncate(strings.TrimSpace(s), 200)
+	return firstLineOf(err.Error())
 }
 
 // omitCoralogixInternalMetricNames drops Coralogix-internal "__name__" values (prefix "cx_") before we

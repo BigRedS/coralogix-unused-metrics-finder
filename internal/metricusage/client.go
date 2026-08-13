@@ -205,14 +205,27 @@ func splitUsage(u UnitsUsage, n int) UnitsUsage {
 	}
 }
 
+// MetricFetchError is a billing lookup that failed for one metric name.
+type MetricFetchError struct {
+	MetricName string
+	Err        error
+}
+
+func (e MetricFetchError) Error() string {
+	return fmt.Sprintf("%q: %v", e.MetricName, e.Err)
+}
+
+func (e MetricFetchError) Unwrap() error { return e.Err }
+
 // EnrichCatalog maps variation-level CX billing onto Prometheus catalog series keys.
 // A CX "variation" is identified by its label-name set: every catalog series whose labels
 // have the same key set as the variation belongs to that variation, and the variation's
 // billed usage is divided evenly across them.
 //
-// Per-metric fetch errors are returned as warnings (one string per failed metric) rather
-// than aborting the whole batch — a single 5xx from CX must not throw away every other
-// metric's billing data. The error return is reserved for the caller's ctx being cancelled.
+// Per-metric fetch errors are returned as MetricFetchError values rather than aborting the whole
+// batch — a single 5xx from CX must not throw away every other metric's billing data. They are
+// returned unformatted so callers can group them by cause instead of emitting one message per
+// metric. The error return is reserved for the caller's ctx being cancelled.
 func (c *Client) EnrichCatalog(
 	ctx context.Context,
 	catalogSeries map[string]map[string]string,
@@ -220,7 +233,7 @@ func (c *Client) EnrichCatalog(
 	startDay, endDay time.Time,
 	workers int,
 	onProgress func(done, total int, metric string),
-) (map[string]UnitsUsage, map[string]int, []string, error) {
+) (map[string]UnitsUsage, map[string]int, []MetricFetchError, error) {
 	if workers <= 0 {
 		workers = 4
 	}
@@ -236,7 +249,7 @@ func (c *Client) EnrichCatalog(
 
 	result := make(map[string]UnitsUsage)
 	splitCount := make(map[string]int)
-	var warnings []string
+	var failures []MetricFetchError
 	var mu sync.Mutex
 
 	total := len(metricNames)
@@ -270,7 +283,7 @@ func (c *Client) EnrichCatalog(
 					return ctx.Err()
 				}
 				mu.Lock()
-				warnings = append(warnings, fmt.Sprintf("%q: %v", mname, err))
+				failures = append(failures, MetricFetchError{MetricName: mname, Err: err})
 				mu.Unlock()
 				if onProgress != nil {
 					onProgress(int(done.Add(1)), total, mname)
@@ -318,7 +331,9 @@ func (c *Client) EnrichCatalog(
 	if err := g.Wait(); err != nil {
 		return nil, nil, nil, err
 	}
-	return result, splitCount, warnings, nil
+	// Failures arrive from parallel workers; sort so warnings are stable across runs.
+	sort.Slice(failures, func(i, j int) bool { return failures[i].MetricName < failures[j].MetricName })
+	return result, splitCount, failures, nil
 }
 
 func toProtoDate(t time.Time) *date.Date {
