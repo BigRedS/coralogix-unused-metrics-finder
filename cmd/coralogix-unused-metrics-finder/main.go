@@ -14,6 +14,7 @@ import (
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/cxteams"
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/metricusage"
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/region"
+	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/report"
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/scan"
 )
 
@@ -205,9 +206,13 @@ func run() int {
 	}
 	if m.SeriesFetchFailuresCount > 0 {
 		fmt.Fprintf(os.Stderr,
-			"Warning: %d metric(s) skipped — Coralogix refused to analyze that many series in one query; see series_fetch_failures in metric_usage_summary.json. Their usage status is unknown (not 'unused') and they are excluded from the OTEL fragment.\n",
+			"Warning: %d of %d metric(s) skipped — their series catalog could not be retrieved (%s); see series_fetch_failures in metric_usage_summary.json. Their usage status is unknown (not 'unused') and they are excluded from the OTEL fragment.\n",
 			m.SeriesFetchFailuresCount,
+			m.DistinctMetricNames,
+			report.SeriesFetchFailureBreakdown(rep.SeriesFetchFailures),
 		)
+		fmt.Fprintln(os.Stderr,
+			"         A shorter --series-lookback-hours (or a larger --timeout-sec for the timed-out ones) may bring them back into the scan.")
 	}
 	if *skipDashboards || *skipAlerts || *skipSLO {
 		var skipped []string

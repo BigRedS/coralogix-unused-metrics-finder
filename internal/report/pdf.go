@@ -95,7 +95,10 @@ func writePDFScanSettings(pdf *fpdf.Fpdf, r *Report) {
 		rows = append(rows, [2]string{"Metrics hit per-metric series cap", fmt.Sprintf("%d (catalog possibly incomplete)", r.Meta.MetricsTruncatedAtSeriesLimit)})
 	}
 	if r.Meta.SeriesFetchFailuresCount > 0 {
-		rows = append(rows, [2]string{"Metrics skipped (server series-analysis cap)", fmt.Sprintf("%d (usage status unknown)", r.Meta.SeriesFetchFailuresCount)})
+		rows = append(rows, [2]string{"Metrics skipped (series fetch failed)", fmt.Sprintf("%d (usage status unknown)", r.Meta.SeriesFetchFailuresCount)})
+		if b := SeriesFetchFailureBreakdown(r.SeriesFetchFailures); b != "" {
+			rows = append(rows, [2]string{"  failure categories", b})
+		}
 	}
 	if r.Meta.CoralogixInternalMetricNamesSkipped > 0 {
 		rows = append(rows, [2]string{"cx_* metrics skipped", fmt.Sprintf("%d", r.Meta.CoralogixInternalMetricNamesSkipped)})
@@ -116,9 +119,11 @@ func writePDFScanSettings(pdf *fpdf.Fpdf, r *Report) {
 		pdfSubHeading(pdf, fmt.Sprintf("Metrics excluded from analysis (%d)", len(r.SeriesFetchFailures)))
 		pdf.SetFont("Helvetica", "", 9)
 		pdf.MultiCell(pdfContentWidth, 5, pdfText(
-			"Coralogix refused to fetch the catalog for these metric names. They are not in the used/unused "+
-				"classification or the OTEL fragment — their usage is unknown, not confirmed unused. Re-run with "+
-				"a shorter --series-lookback-hours window to bring them under the server cap."),
+			"The series catalog for these metric names could not be retrieved - Coralogix refused the query "+
+				"(server series-analysis cap), answered with a server error, or it timed out. Typically these "+
+				"are the highest-cardinality metrics in the account. They are not in the used/unused "+
+				"classification or the OTEL fragment - their usage is unknown, not confirmed unused. Re-run with "+
+				"a shorter --series-lookback-hours window, or a larger --timeout-sec for the timed-out ones."),
 			"", "L", false)
 		limit := pdfTopRows
 		if limit > len(r.SeriesFetchFailures) {
@@ -126,7 +131,11 @@ func writePDFScanSettings(pdf *fpdf.Fpdf, r *Report) {
 		}
 		pdf.SetFont("Courier", "", 8)
 		for _, f := range r.SeriesFetchFailures[:limit] {
-			pdf.MultiCell(pdfContentWidth, 4, pdfText("  - "+f.MetricName), "", "L", false)
+			line := "  - " + f.MetricName
+			if f.Category != "" {
+				line += "  (" + f.Category + ")"
+			}
+			pdf.MultiCell(pdfContentWidth, 4, pdfText(line), "", "L", false)
 		}
 		if remaining := len(r.SeriesFetchFailures) - limit; remaining > 0 {
 			pdf.SetFont("Helvetica", "I", 8)

@@ -38,6 +38,21 @@ go run ./webui -listen localhost:8765
 
 see `webui/README.md` for more info.
 
+### Metrics whose series can't be retrieved
+
+Very high-cardinality metrics sometimes can't be enumerated at all. The `/api/v1/series` query for them may be refused outright (the server-side series-analysis cap, `ViolationTypeTotalSeriesAnalyzed`), time out, or come back as a `500`. None of these aborts the scan: the metric name is recorded in **`series_fetch_failures`** in `metric_usage_summary.json` with a `category` and a reason, and the scan continues without it. Counts appear in `meta.series_fetch_failures_count` / `meta.series_fetch_timeouts_count`, as a stderr warning, and in the PDF.
+
+| `category` | Meaning |
+|------------|---------|
+| `series_analysis_cap` | Coralogix refused the query: more series in the window than it will analyze at once. |
+| `timeout` | The query didn't finish before `--timeout-sec`. |
+| `server_error` | Coralogix answered `5xx`/`429` for this metric — commonly what the series endpoint does for a metric it can't enumerate. |
+| `transport` | The request failed outside an HTTP status (connection reset, unreadable body). |
+
+Such metrics are **excluded from used/unused classification and from the OTEL fragment** — their usage is *unknown*, not confirmed unused. To bring them into the scan, shorten **`--series-lookback-hours`**, or raise **`--timeout-sec`** for the timed-out ones.
+
+Two things still fail the run, so a broken scan never masquerades as "everything is unused": statuses that mean the *request* was rejected rather than the metric (`400`, `401`, `402`, `403`, `404`, `405` — bad key, missing permission, wrong region), and more than **half** the metric names failing, whatever the reason.
+
 If your API key lacks **Dashboards**, **Alerts**, or **SLO** access, pass **`--skip-dashboards`**, **`--skip-alerts`**, and/or **`--skip-slo`** so the scan skips those HTTP calls. Correlation (used vs unused, OTEL drops/strips) then considers only PromQL from the sources that ran; skipped modes append **`warnings`** in `metric_usage_summary.json`. Skipping **all three** makes every catalog series appear unused.
 
 

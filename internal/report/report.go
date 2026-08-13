@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 type Meta struct {
@@ -25,15 +27,65 @@ type Meta struct {
 	UsageBillingCalendarMonths          int    `json:"usage_billing_calendar_months,omitempty"` // >0 means window came from last N complete UTC months (not rolling days).
 	SeriesWithBillingData               int    `json:"series_with_billing_data,omitempty"`
 	UnusedSeriesWithBilling             int    `json:"unused_series_with_billing,omitempty"`
-	// SeriesFetchFailuresCount counts metric names whose /api/v1/series query was rejected
-	// by Coralogix (typically the server-side per-query series-analysis cap). Those metrics
-	// are absent from the catalog and therefore from used/unused/OTEL outputs.
+	// SeriesFetchFailuresCount counts metric names whose /api/v1/series query never returned a
+	// catalog — rejected by the server-side per-query series-analysis cap, or timed out. Those
+	// metrics are absent from the catalog and therefore from used/unused/OTEL outputs.
 	SeriesFetchFailuresCount int `json:"series_fetch_failures_count,omitempty"`
+	// SeriesFetchTimeoutsCount is the subset of SeriesFetchFailuresCount that timed out rather
+	// than being refused outright. A higher --timeout-sec or shorter lookback may recover them.
+	SeriesFetchTimeoutsCount int `json:"series_fetch_timeouts_count,omitempty"`
 }
 
-// MetricSeriesFetchFailure records a metric whose catalog series fetch was rejected by Coralogix.
+// Series fetch failure categories (MetricSeriesFetchFailure.Category).
+const (
+	// SeriesFailureAnalysisCap — Coralogix refused the query outright (ViolationTypeTotalSeriesAnalyzed).
+	SeriesFailureAnalysisCap = "series_analysis_cap"
+	// SeriesFailureTimeout — the query ran past the request timeout without answering.
+	SeriesFailureTimeout = "timeout"
+	// SeriesFailureServerError — Coralogix answered with a server error (typically 500) for this metric.
+	SeriesFailureServerError = "server_error"
+	// SeriesFailureTransport — the request failed before/outside an HTTP status (connection reset, bad body).
+	SeriesFailureTransport = "transport"
+)
+
+// SeriesFetchFailureCounts tallies failures by category, e.g. {"timeout": 3, "server_error": 1}.
+func SeriesFetchFailureCounts(failures []MetricSeriesFetchFailure) map[string]int {
+	counts := make(map[string]int, 4)
+	for _, f := range failures {
+		cat := f.Category
+		if cat == "" {
+			cat = "unknown"
+		}
+		counts[cat]++
+	}
+	return counts
+}
+
+// SeriesFetchFailureBreakdown renders SeriesFetchFailureCounts as a stable, readable list
+// ("2 timeout, 1 server_error") for warnings, CLI output and the PDF.
+func SeriesFetchFailureBreakdown(failures []MetricSeriesFetchFailure) string {
+	counts := SeriesFetchFailureCounts(failures)
+	cats := make([]string, 0, len(counts))
+	for cat := range counts {
+		cats = append(cats, cat)
+	}
+	sort.Slice(cats, func(i, j int) bool {
+		if counts[cats[i]] != counts[cats[j]] {
+			return counts[cats[i]] > counts[cats[j]]
+		}
+		return cats[i] < cats[j]
+	})
+	parts := make([]string, 0, len(cats))
+	for _, cat := range cats {
+		parts = append(parts, strconv.Itoa(counts[cat])+" "+cat)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// MetricSeriesFetchFailure records a metric whose catalog series fetch did not produce a result.
 type MetricSeriesFetchFailure struct {
 	MetricName string `json:"metric_name"`
+	Category   string `json:"category,omitempty"`
 	Reason     string `json:"reason"`
 }
 
@@ -86,9 +138,9 @@ type Report struct {
 	ReferencedSelectorsWithoutMetricName               []SelectorRefIssue `json:"referenced_selectors_without_metric_name"`
 	ReferencedSelectorsMetricAbsentInTimeseriesWindow  []SelectorRefIssue `json:"referenced_selectors_metric_absent_in_timeseries_window"`
 	ReferencedSelectorsMetricPresentButNoSeriesMatches []SelectorRefIssue `json:"referenced_selectors_metric_present_but_no_series_matches"`
-	// SeriesFetchFailures lists metric names whose catalog could not be fetched (e.g. server-side
-	// series-analysis cap). These metrics are excluded from used/unused classification — their
-	// usage status is unknown rather than confirmed unused.
+	// SeriesFetchFailures lists metric names whose catalog could not be fetched (server-side
+	// series-analysis cap, or the query timing out). These metrics are excluded from used/unused
+	// classification — their usage status is unknown rather than confirmed unused.
 	SeriesFetchFailures []MetricSeriesFetchFailure `json:"series_fetch_failures,omitempty"`
 	Warnings            []string                   `json:"warnings"`
 
