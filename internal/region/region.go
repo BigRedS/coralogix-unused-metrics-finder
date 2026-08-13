@@ -87,6 +87,29 @@ func isHostname(s string) bool {
 	return true
 }
 
+// grpcHostLabel is the first label of Coralogix's dedicated gRPC endpoint.
+//
+// The REST host (api.<domain>) is not a gRPC endpoint. On the legacy-domain clusters — eu1
+// (api.coralogix.com), us1 (api.coralogix.us), ap1 (api.coralogix.in) and ap2
+// (api.coralogixsg.com) — it does not negotiate ALPN at all, and grpc-go rejects such
+// connections outright ("credentials: cannot check peer: missing selected ALPN property"), so
+// every gRPC call fails at the TLS handshake. ng-api-grpc.<domain> negotiates h2 on all
+// regions, including the four where api.<domain> happens to work.
+const grpcHostLabel = "ng-api-grpc."
+
+// GRPCHost maps a management/metrics API host to the gRPC host serving the same account
+// (api.eu2.coralogix.com -> ng-api-grpc.eu2.coralogix.com).
+//
+// A host that is not "api.<domain>" is returned unchanged: that covers an explicit gRPC host
+// (--grpc-host) and an already-mapped one, so applying GRPCHost twice is harmless.
+func GRPCHost(host string) string {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if rest, ok := strings.CutPrefix(h, "api."); ok {
+		return grpcHostLabel + rest
+	}
+	return h
+}
+
 func MgmtOpenAPIV5Base(apiHost string) string {
 	return "https://" + apiHost + "/mgmt/openapi/5"
 }

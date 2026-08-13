@@ -53,6 +53,19 @@ Such metrics are **excluded from used/unused classification and from the OTEL fr
 
 Two things still fail the run, so a broken scan never masquerades as "everything is unused": statuses that mean the *request* was rejected rather than the metric (`400`, `401`, `402`, `403`, `404`, `405` — bad key, missing permission, wrong region), and more than **half** the metric names failing, whatever the reason.
 
+### REST and gRPC endpoints
+
+The scan uses two endpoints per account, and they are **not the same host**:
+
+| | host | used for |
+|---|---|---|
+| REST | `api.<domain>` | metric names, series, dashboards, alerts, SLOs |
+| gRPC | `ng-api-grpc.<domain>` | CX billing (`unit_usage`) and team-name lookup |
+
+This matters because on eu1, us1, ap1 and ap2 the REST host does **not** negotiate ALPN, and grpc-go rejects such connections outright — every billing call fails at the TLS handshake with `credentials: cannot check peer: missing selected ALPN property`. `ng-api-grpc.<domain>` negotiates h2 on every region, so that is what the tool dials; `region.GRPCHost` derives it from `--region`. Override with **`--grpc-host`** if a cluster differs.
+
+Do not "fix" an ALPN failure with `GRPC_ENFORCE_ALPN_ENABLED=false`: it has to be exported before the process starts (grpc-go reads it at package init), it applies to every connection in the process, it drops the guarantee that the peer intends to speak HTTP/2, and grpc-go warns it will stop being honoured in a future release. Point the tool at the right host instead.
+
 ### Memory use on large accounts
 
 The scan holds the whole series catalog in memory while it correlates, so peak memory scales with **distinct series**, not metric names. Roughly **0.5–1.5 KB per series** after interning (wider label sets cost more), so a 3M-series account needs a few GB. On a memory-pressured machine the process can be killed outright — on macOS that appears as `Killed: 9` with no Go panic. `/usr/bin/time -l` reports the actual peak (`maximum resident set size`).
