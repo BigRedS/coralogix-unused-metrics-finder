@@ -111,6 +111,9 @@ func (reg *registry) handleRegions(w http.ResponseWriter, r *http.Request) {
 type runRequest struct {
 	Region string `json:"region"`
 	APIKey string `json:"api_key"`
+	// Billing mirrors the CLI's --billing: off by default, because the cost lookup is slow and
+	// its per-series outputs are by far the largest files in the download.
+	Billing bool `json:"billing"`
 }
 
 func (reg *registry) handleRun(w http.ResponseWriter, r *http.Request) {
@@ -147,12 +150,12 @@ func (reg *registry) handleRun(w http.ResponseWriter, r *http.Request) {
 	reg.jobs[id] = j
 	reg.mu.Unlock()
 
-	go reg.runScan(j, apiHost, req.APIKey)
+	go reg.runScan(j, apiHost, req.APIKey, req.Billing)
 
 	writeJSON(w, http.StatusOK, map[string]string{"job_id": id})
 }
 
-func (reg *registry) runScan(j *job, apiHost, apiKey string) {
+func (reg *registry) runScan(j *job, apiHost, apiKey string, billing bool) {
 	j.setStatus("running")
 
 	dir, err := os.MkdirTemp("", "coralogix-unused-metrics-finder-webui-*")
@@ -165,19 +168,24 @@ func (reg *registry) runScan(j *job, apiHost, apiKey string) {
 	ctx := context.Background()
 	client := coralogix.NewClient(apiHost, apiKey, 120*time.Second)
 
-	billingClient, err := metricusage.NewClient(region.GRPCHost(apiHost), apiKey)
-	if err != nil {
-		j.fail(fmt.Errorf("billing client: %w", err))
-		_ = os.RemoveAll(dir)
-		return
+	var billingClient *metricusage.Client
+	usageLookbackDays := 0
+	if billing {
+		billingClient, err = metricusage.NewClient(region.GRPCHost(apiHost), apiKey)
+		if err != nil {
+			j.fail(fmt.Errorf("billing client: %w", err))
+			_ = os.RemoveAll(dir)
+			return
+		}
+		defer billingClient.Close()
+		usageLookbackDays = 7
 	}
-	defer billingClient.Close()
 
 	rep, err := scan.Run(ctx, client, scan.Options{
 		SeriesLookback:             25 * time.Hour,
 		SeriesLimitPerMetric:       50_000,
 		Workers:                    8,
-		UsageLookbackDays:          7,
+		UsageLookbackDays:          usageLookbackDays,
 		UsageBillingCalendarMonths: 0,
 		Billing:                    billingClient,
 		Quiet:                      true,

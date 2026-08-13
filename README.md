@@ -26,7 +26,9 @@ go build -o bin/coralogix-unused-metrics-finder ./cmd/coralogix-unused-metrics-f
 ./bin/coralogix-unused-metrics-finder --region eu2 --key "$CX_API_KEY" --output-dir ./out
 ```
 
-See `--help` for flags (`--usage-lookback-days`, `--usage-billing-calendar-months`, `--skip-billing`, `--skip-dashboards`, `--skip-alerts`, `--skip-slo`, etc.).
+Cost data is **opt-in**: add **`--billing`** for `unit_usage` figures and the cost-ranked outputs (see [CX billing is opt-in](#cx-billing-is-opt-in---billing)).
+
+See `--help` for flags (`--billing`, `--usage-lookback-days`, `--usage-billing-calendar-months`, `--grpc-host`, `--skip-dashboards`, `--skip-alerts`, `--skip-slo`, etc.).
 
 ### Browser UI
 
@@ -90,17 +92,25 @@ If the API key has team-admin scope the tool first calls **`TeamService.ListTeam
 |------|-------------|
 | `metric_usage_summary.json` | Full report: correlation results, warnings, `meta` (including `usage_lookback_days`, `series_with_billing_data`, `unused_series_with_billing`, `coralogix_internal_metric_names_skipped`). Unused entries here use optional nested `"billing": { "unit_usage": … }` when matched. |
 | `metric_usage_unused_series.json` | Unused series only (alphabetically by full selector string). |
-| **`metric_usage_unused_by_cost.json`** | Same unused series, **sorted by cost**, with **flat** billing fields on every row (easier for `jq` / tooling). |
-| **`metric_usage_unused_by_cost.csv`** | Same data as the JSON cost file, as a spreadsheet-friendly CSV. |
+| **`metric_usage_unused_by_cost.json`** | Same unused series, **sorted by cost**, with **flat** billing fields on every row (easier for `jq` / tooling). **`--billing` only** — see below. |
+| **`metric_usage_unused_by_cost.csv`** | Same data as the JSON cost file, as a spreadsheet-friendly CSV. **`--billing` only.** |
 | **`metric_usage_unused_by_metric.json`** | **Rollup**: one row per unused **`__name__`**, sorted by **`unit_usage_sum`** — sums billing fields over unused series that have CX data (see below). |
 | **`metric_usage_unused_by_metric.csv`** | Same metric rollup as spreadsheet-friendly CSV. |
 | **`metric_usage_all_by_metric.csv`** | One row per **`__name__`** across **both** used and unused catalog series: `metric_name`, `series_count` (distinct catalog series), `unit_usage_sum` (summed CX billing over the window). |
 | **`metric_usage_otel_processors.yaml`** | Fragment for **otelcol-contrib**: drops metrics that are unused end-to-end, and strips label keys that appear only on unused series for partially-used metrics (see below). |
 | **`metric_usage_report.pdf`** | Printable summary of the run: scan settings, headline numbers, top unused metrics by cost, and step-by-step instructions for applying the OTEL fragment. Same content is derivable from the other files — provided as a single human-readable artefact to share. |
 
-### CX billing window (**`unit_usage`** sample span)
+### CX billing is opt-in (**`--billing`**)
 
-Billing is skipped when **`--skip-billing`** is set, or when both **`--usage-lookback-days`** is **`0`** and **`--usage-billing-calendar-months`** is **`0`**.
+**Billing is off by default.** Pass **`--billing`** to fetch CX cost data (`unit_usage`, `bytes_volume`, `sample_count` per series). It is opt-in because the lookup is slow — one gRPC call per metric name — and because its two per-series outputs, `metric_usage_unused_by_cost.json` and `.csv`, are by far the largest files the tool writes.
+
+Without `--billing` you still get the whole point of the tool: which series are unused, the per-metric rollups, and the OTEL fragment. What you lose is what those series **cost**, so nothing is ranked or scored by spend.
+
+When there is no billing data — `--billing` not given, or the lookup returned nothing — the two cost files are **not written at all** (with every cost column empty, the "by cost" order degrades to the series name and they become bulky duplicates of `metric_usage_unused_series.json`), and the PDF prints `not collected` / `unavailable` in place of cost figures rather than a `0` that would read as measured. The reason appears in `warnings` in `metric_usage_summary.json` either way.
+
+**`--skip-billing`** is retained but no longer needed: it forces billing off, which is now the default.
+
+The window flags below apply **only** with `--billing`:
 
 - **`--usage-lookback-days`** (default **`7`**) — rolling window of inclusive **UTC calendar days** ending at **today’s UTC date** (midnight-aligned). Example: on **2026-05-15**, **`7`** means **2026-05-09** through **2026-05-15** inclusive.
 - **`--usage-billing-calendar-months N`** (**`N > 0`**) — last **`N`** **complete UTC calendar months**, excluding the current partial month: from the **first day** of month **`current − N`** through the **last day** of the **previous** month. If both rolling days and **`N`** are non-zero, **calendar months win** for the API request (CLI still accepts both flags).

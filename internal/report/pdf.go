@@ -86,7 +86,7 @@ func writePDFScanSettings(pdf *fpdf.Fpdf, r *Report) {
 	case r.Meta.UsageLookbackDays > 0:
 		rows = append(rows, [2]string{"Billing window", fmt.Sprintf("rolling %d UTC day(s)", r.Meta.UsageLookbackDays)})
 	default:
-		rows = append(rows, [2]string{"Billing window", "skipped (no unit_usage on output)"})
+		rows = append(rows, [2]string{"Billing window", "not collected (run with --billing for cost figures)"})
 	}
 	if r.Meta.UsageBillingUTCStartDate != "" || r.Meta.UsageBillingUTCEndDate != "" {
 		rows = append(rows, [2]string{"Billing dates (UTC)", fmt.Sprintf("%s -> %s", r.Meta.UsageBillingUTCStartDate, r.Meta.UsageBillingUTCEndDate)})
@@ -149,6 +149,19 @@ func writePDFScanSettings(pdf *fpdf.Fpdf, r *Report) {
 	pdf.Ln(2)
 }
 
+// costCell renders a cost figure, or says why there is none. Without this, a scan with no
+// billing data prints "0" for every cost and saving, which reads as a measurement of zero cost
+// rather than an absence of data — the worst possible confusion in a customer-facing report.
+func costCell(r *Report, formatted string) string {
+	if r.HasBillingData() {
+		return formatted
+	}
+	if r.BillingRequested() {
+		return "unavailable - billing lookup returned no data"
+	}
+	return "not collected - run with --billing"
+}
+
 func writePDFHeadline(pdf *fpdf.Fpdf, r *Report, byMetric []UnusedByMetricRow, plan OTELProcessorPlan) {
 	pdfHeading(pdf, "Headline numbers")
 
@@ -191,10 +204,10 @@ func writePDFHeadline(pdf *fpdf.Fpdf, r *Report, byMetric []UnusedByMetricRow, p
 		{"Distinct catalog series", commaInt(int64(totalCatalog))},
 		{"Used series", commaInt(int64(len(r.UsedSeriesInCatalog)))},
 		{"Unused series", fmt.Sprintf("%s (%.1f%% of catalog)", commaInt(int64(unusedTotal)), unusedPct)},
-		{"Unused series with CX billing data", fmt.Sprintf("%s of %s", commaInt(int64(r.Meta.UnusedSeriesWithBilling)), commaInt(int64(r.Meta.SeriesWithBillingData)))},
-		{"Attributed unit_usage (unused, in window)", formatFloatHuman(totalUnitUsage)},
-		{"Attributed bytes_volume (unused, in window)", formatBytes(totalBytes)},
-		{"Attributed sample_count (unused, in window)", commaInt(int64(totalSamples))},
+		{"Unused series with CX billing data", costCell(r, fmt.Sprintf("%s of %s", commaInt(int64(r.Meta.UnusedSeriesWithBilling)), commaInt(int64(r.Meta.SeriesWithBillingData))))},
+		{"Attributed unit_usage (unused, in window)", costCell(r, formatFloatHuman(totalUnitUsage))},
+		{"Attributed bytes_volume (unused, in window)", costCell(r, formatBytes(totalBytes))},
+		{"Attributed sample_count (unused, in window)", costCell(r, commaInt(int64(totalSamples)))},
 	}
 	writePDFKVTable(pdf, rows)
 	pdf.Ln(2)
@@ -202,8 +215,8 @@ func writePDFHeadline(pdf *fpdf.Fpdf, r *Report, byMetric []UnusedByMetricRow, p
 	pdfSubHeading(pdf, "What the OTEL fragment would change")
 	rows = [][2]string{
 		{"Metrics dropped wholesale", fmt.Sprintf("%d metric name(s), %s series", len(plan.DropMetricNames), commaInt(int64(dropSeriesCount)))},
-		{"Estimated unit_usage avoided by drops", formatFloatHuman(dropUnitUsage)},
-		{"Estimated bytes_volume avoided by drops", formatBytes(dropBytes)},
+		{"Estimated unit_usage avoided by drops", costCell(r, formatFloatHuman(dropUnitUsage))},
+		{"Estimated bytes_volume avoided by drops", costCell(r, formatBytes(dropBytes))},
 		{"Metrics with label keys stripped", fmt.Sprintf("%d metric(s), %d delete_key statement(s)", len(stripMetricNames), len(plan.StripStatements))},
 	}
 	writePDFKVTable(pdf, rows)

@@ -151,6 +151,19 @@ type Report struct {
 	BillingSplitCountBySeries map[string]int `json:"-"`
 }
 
+// HasBillingData reports whether any series carries CX billing figures. False both when billing
+// was never requested (--billing off) and when the lookup returned nothing — in either case no
+// cost figure in this report is a measurement.
+func (r *Report) HasBillingData() bool {
+	return r.Meta.SeriesWithBillingData > 0
+}
+
+// BillingRequested reports whether a billing window was queried at all, which is what separates
+// "not collected" from "collected but empty" when explaining missing cost figures.
+func (r *Report) BillingRequested() bool {
+	return r.Meta.UsageLookbackDays > 0 || r.Meta.UsageBillingCalendarMonths > 0
+}
+
 func SortUsedSeries(s []UsedSeries) {
 	sort.Slice(s, func(i, j int) bool { return s[i].Series < s[j].Series })
 }
@@ -256,17 +269,23 @@ func (r *Report) Write(outputDir, filenamePrefix string) ([]string, error) {
 	}
 	costRows := unusedRowsFromSeries(unusedByCost, splitN)
 
-	byCostName, byCostPath := join("metric_usage_unused_by_cost.json")
-	if err := writeJSONArrayFile(byCostPath, costRows); err != nil {
-		return nil, err
-	}
-	written = append(written, byCostName)
+	// The per-series cost files are the largest outputs by far, and with no billing data they
+	// carry none: every cost column is empty and the "by cost" ordering degrades to the series
+	// name, making them a bulky duplicate of metric_usage_unused_series.json. Skip them rather
+	// than hand over gigabytes of zeroes that read like measured savings.
+	if r.HasBillingData() {
+		byCostName, byCostPath := join("metric_usage_unused_by_cost.json")
+		if err := writeJSONArrayFile(byCostPath, costRows); err != nil {
+			return nil, err
+		}
+		written = append(written, byCostName)
 
-	byCostCSVName, byCostCSVPath := join("metric_usage_unused_by_cost.csv")
-	if err := WriteUnusedByCostCSV(byCostCSVPath, costRows); err != nil {
-		return nil, err
+		byCostCSVName, byCostCSVPath := join("metric_usage_unused_by_cost.csv")
+		if err := WriteUnusedByCostCSV(byCostCSVPath, costRows); err != nil {
+			return nil, err
+		}
+		written = append(written, byCostCSVName)
 	}
-	written = append(written, byCostCSVName)
 
 	byMetric := AggregateUnusedByMetric(costRows)
 	byMetricName, byMetricPath := join("metric_usage_unused_by_metric.json")

@@ -93,6 +93,14 @@ func TestRunSkipsMetricWithServerError(t *testing.T) {
 	if !hasWarningContaining(rep.Warnings, "boom") && !hasWarningContaining(rep.Warnings, "series catalog could not be retrieved") {
 		t.Errorf("warnings do not mention the skipped metric: %v", rep.Warnings)
 	}
+	// Billing is opt-in, and its absence must be stated rather than left to be inferred from
+	// empty cost columns. This also proves the folding warning set reaches the report.
+	if !hasWarningContaining(rep.Warnings, "CX billing data not collected") {
+		t.Errorf("no warning that billing was not collected: %v", rep.Warnings)
+	}
+	if rep.HasBillingData() {
+		t.Error("report claims billing data without a billing client")
+	}
 }
 
 // When most of the catalog fails, the scan must refuse rather than report the remainder as unused.

@@ -383,6 +383,9 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 	billingCalMonths := opt.UsageBillingCalendarMonths
 
 	billingEnabled := opt.Billing != nil && (opt.UsageLookbackDays > 0 || opt.UsageBillingCalendarMonths > 0)
+	if !billingEnabled {
+		warnings = append(warnings, "CX billing data not collected (--billing off): no unit_usage, bytes_volume or sample_count figures anywhere in this report, and no cost-ranked outputs. Which series are unused is unaffected — only their cost is unknown.")
+	}
 	if billingEnabled {
 		startDay, endDay, inclDays, winErr := billingWindowUTC(time.Now(), opt.UsageLookbackDays, opt.UsageBillingCalendarMonths)
 		if winErr != nil {
@@ -409,6 +412,9 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 					billingBySeries[k] = toReportBilling(u)
 				}
 				billingSplitBySeries = splitCounts
+			}
+			if len(billingBySeries) == 0 {
+				warnings = append(warnings, "CX billing was requested but returned no usable data: no unit_usage, bytes_volume or sample_count figures anywhere in this report, and no cost-ranked outputs. Cost figures are missing, not zero. Which series are unused is unaffected.")
 			}
 		}
 	}

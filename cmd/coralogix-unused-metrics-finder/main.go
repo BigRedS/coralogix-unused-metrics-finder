@@ -101,9 +101,10 @@ func run() int {
 	workers := flag.Int("workers", 8, "parallel series fetches")
 	timeoutSec := flag.Int("timeout-sec", 120, "HTTP client timeout per request")
 	grpcHostFlag := flag.String("grpc-host", "", "override the gRPC endpoint for billing and team lookup (default: ng-api-grpc.<domain> derived from --region)")
-	usageDays := flag.Int("usage-lookback-days", 7, "rolling inclusive UTC calendar days ending today for CX unit_usage (0 skips rolling window; use --usage-billing-calendar-months instead)")
+	billing := flag.Bool("billing", false, "fetch CX billing data (unit_usage/bytes_volume per series) and write the cost-ranked outputs; off by default because those per-series files are large and the lookup is slow")
+	usageDays := flag.Int("usage-lookback-days", 7, "with --billing: rolling inclusive UTC calendar days ending today for CX unit_usage (ignored without --billing)")
 	usageMonths := flag.Int("usage-billing-calendar-months", 0, "if >0, CX unit_usage window is the last N complete UTC calendar months (overrides rolling days when both set); 0 uses rolling days only")
-	skipBilling := flag.Bool("skip-billing", false, "skip Metrics Usage API (no unit_usage on output)")
+	skipBilling := flag.Bool("skip-billing", false, "deprecated and no longer needed: billing is off unless --billing is given; when set it forces billing off")
 	skipDashboards := flag.Bool("skip-dashboards", false, "skip dashboard catalog and definitions (omit Dashboard preset)")
 	skipAlerts := flag.Bool("skip-alerts", false, "skip alert definitions v3 (omit Alerts preset)")
 	skipSLO := flag.Bool("skip-slo", false, "skip SLO list (omit SLO preset)")
@@ -118,6 +119,12 @@ func run() int {
 
 	if *usageDays < 0 || *usageMonths < 0 {
 		fmt.Fprintln(os.Stderr, "usage lookback days and billing calendar months must be non-negative")
+		return 2
+	}
+
+	billingEnabled := *billing && !*skipBilling
+	if billingEnabled && *usageDays == 0 && *usageMonths == 0 {
+		fmt.Fprintln(os.Stderr, "--billing needs a window: set --usage-lookback-days (default 7) or --usage-billing-calendar-months")
 		return 2
 	}
 
@@ -143,7 +150,7 @@ func run() int {
 	ctx := context.Background()
 
 	var billingClient *metricusage.Client
-	if !*skipBilling && (*usageDays > 0 || *usageMonths > 0) {
+	if billingEnabled {
 		billingClient, err = metricusage.NewClient(grpcHost, *keyFlag)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "billing client:", err)
@@ -154,18 +161,25 @@ func run() int {
 
 	if *debugBillingMetric != "" {
 		if billingClient == nil {
-			fmt.Fprintln(os.Stderr, "--debug-billing-metric requires --usage-lookback-days > 0 (or --usage-billing-calendar-months > 0) and no --skip-billing")
+			fmt.Fprintln(os.Stderr, "--debug-billing-metric requires --billing (with a window: --usage-lookback-days or --usage-billing-calendar-months)")
 			return 2
 		}
 		return runDebugBilling(ctx, billingClient, *debugBillingMetric, *usageDays, *usageMonths)
+	}
+
+	// Without --billing the window flags keep their defaults but must not reach the scan, or it
+	// would report a billing window it never queried.
+	usageLookbackDays, usageBillingMonths := 0, 0
+	if billingEnabled {
+		usageLookbackDays, usageBillingMonths = *usageDays, *usageMonths
 	}
 
 	rep, err := scan.Run(ctx, client, scan.Options{
 		SeriesLookback:             time.Duration(*lookbackHours * float64(time.Hour)),
 		SeriesLimitPerMetric:       *seriesLimit,
 		Workers:                    *workers,
-		UsageLookbackDays:          *usageDays,
-		UsageBillingCalendarMonths: *usageMonths,
+		UsageLookbackDays:          usageLookbackDays,
+		UsageBillingCalendarMonths: usageBillingMonths,
 		Billing:                    billingClient,
 		Quiet:                      *quiet,
 		SkipDashboards:             *skipDashboards,
