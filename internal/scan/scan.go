@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -208,22 +211,23 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 
 			series, trunc, err := client.FetchSeriesForMetric(gctx, mname, start, now, opt.SeriesLimitPerMetric)
 			if err != nil {
-				var limitErr *coralogix.SeriesAnalysisLimitError
-				if errors.As(err, &limitErr) {
-					mu.Lock()
-					seriesFetchFailures = append(seriesFetchFailures, report.MetricSeriesFetchFailure{
-						MetricName: mname,
-						Reason:     "Coralogix rejected /api/v1/series with ViolationTypeTotalSeriesAnalyzed — this metric has more time series in the lookback window than the server will analyze in one query. Reduce --series-lookback-hours or treat this metric as unanalyzable.",
-					})
-					mu.Unlock()
-					done := metricsDone.Add(1)
-					setStatus(fmt.Sprintf(
-						"metrics %d/%d — series limit hit on %s (skipped)",
-						done, metricsTotal, truncate(mname, 40),
-					))
-					return nil
+				// A cancelled/expired caller context is scan-wide: stop rather than blaming the metric.
+				if ctx.Err() != nil {
+					return ctx.Err()
 				}
-				return err
+				failure, skip := classifySeriesFetchFailure(mname, err)
+				if !skip {
+					return err
+				}
+				mu.Lock()
+				seriesFetchFailures = append(seriesFetchFailures, failure)
+				mu.Unlock()
+				done := metricsDone.Add(1)
+				setStatus(fmt.Sprintf(
+					"metrics %d/%d — %s on %s (skipped)",
+					done, metricsTotal, failure.Category, truncate(mname, 40),
+				))
+				return nil
 			}
 			mu.Lock()
 			if trunc {
@@ -248,10 +252,25 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 		return nil, err
 	}
 
+	// Failures arrive from parallel workers; sort so report output is stable across runs.
+	sort.Slice(seriesFetchFailures, func(i, j int) bool {
+		return seriesFetchFailures[i].MetricName < seriesFetchFailures[j].MetricName
+	})
+
+	seriesFetchTimeouts := report.SeriesFetchFailureCounts(seriesFetchFailures)[report.SeriesFailureTimeout]
 	if len(seriesFetchFailures) > 0 {
+		// Too much of the catalog missing means the remainder can't support "unused" claims.
+		if float64(len(seriesFetchFailures)) > maxSeriesFetchFailureFraction*float64(len(metricNames)) {
+			return nil, fmt.Errorf(
+				"series fetch failed for %d of %d metric names (%s) — too much of the catalog is missing to report on; first failure: %s",
+				len(seriesFetchFailures), len(metricNames),
+				report.SeriesFetchFailureBreakdown(seriesFetchFailures),
+				seriesFetchFailures[0].MetricName,
+			)
+		}
 		warnings = append(warnings, fmt.Sprintf(
-			"%d metric name(s) skipped because Coralogix refused to analyze that many series in one query — see series_fetch_failures for the list. These metrics are excluded from used/unused classification and the OTEL fragment; their usage status is unknown, not unused.",
-			len(seriesFetchFailures),
+			"%d of %d metric name(s) skipped because their series catalog could not be retrieved (%s) — see series_fetch_failures for the list and per-metric reasons. These metrics are excluded from used/unused classification and the OTEL fragment; their usage status is unknown, not unused.",
+			len(seriesFetchFailures), len(metricNames), report.SeriesFetchFailureBreakdown(seriesFetchFailures),
 		))
 	}
 
@@ -441,6 +460,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 			SeriesWithBillingData:               len(billingBySeries),
 			UnusedSeriesWithBilling:             unusedWithBilling,
 			SeriesFetchFailuresCount:            len(seriesFetchFailures),
+			SeriesFetchTimeoutsCount:            seriesFetchTimeouts,
 		},
 		Dashboards:                           dashboards,
 		UsedSeriesInCatalog:                  used,
@@ -448,10 +468,72 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 		ReferencedSelectorsWithoutMetricName: noMetricName,
 		ReferencedSelectorsMetricAbsentInTimeseriesWindow:  metricAbsent,
 		ReferencedSelectorsMetricPresentButNoSeriesMatches: noLabelMatch,
-		SeriesFetchFailures:                                seriesFetchFailures,
-		Warnings:                                           warnings,
-		BillingSplitCountBySeries:                          billingSplitBySeries,
+		SeriesFetchFailures:       seriesFetchFailures,
+		Warnings:                  warnings,
+		BillingSplitCountBySeries: billingSplitBySeries,
 	}, nil
+}
+
+// maxSeriesFetchFailureFraction bounds how much of the catalog may be missing before the scan
+// refuses to report at all. Individual metrics failing is normal (huge metrics break the series
+// endpoint); most of them failing means something systemic — a rate limit, an outage — and a
+// report built from the remainder would call metrics unused on no evidence.
+const maxSeriesFetchFailureFraction = 0.5
+
+// classifySeriesFetchFailure decides whether a /api/v1/series failure for one metric can be
+// noted and skipped (skip=true) or must fail the whole scan. Skipping is the default: the
+// endpoint fails in several metric-specific ways (the series-analysis cap, timeouts, and 5xx
+// on metrics it cannot enumerate), and one bad metric must not throw away the scan. Only
+// statuses that say the request itself was unacceptable — bad key, missing permission, bad
+// path — abort, since those would fail identically for every metric and would otherwise
+// produce a report claiming the whole estate is unused. Run-wide safety net: the caller also
+// aborts if too large a fraction of metrics failed (see maxSeriesFetchFailureFraction).
+func classifySeriesFetchFailure(metricName string, err error) (report.MetricSeriesFetchFailure, bool) {
+	failure := report.MetricSeriesFetchFailure{MetricName: metricName}
+
+	var limitErr *coralogix.SeriesAnalysisLimitError
+	if errors.As(err, &limitErr) {
+		failure.Category = report.SeriesFailureAnalysisCap
+		failure.Reason = "Coralogix rejected /api/v1/series with ViolationTypeTotalSeriesAnalyzed — this metric has more time series in the lookback window than the server will analyze in one query. Reduce --series-lookback-hours or treat this metric as unanalyzable."
+		return failure, true
+	}
+
+	var timeoutErr *coralogix.SeriesTimeoutError
+	if errors.As(err, &timeoutErr) {
+		failure.Category = report.SeriesFailureTimeout
+		failure.Reason = fmt.Sprintf("the /api/v1/series query for this metric did not complete before the request timeout — usually a metric with a very large number of series (%s). Raise --timeout-sec, reduce --series-lookback-hours, or treat this metric as unanalyzable.", firstLine(timeoutErr.Cause))
+		return failure, true
+	}
+
+	var statusErr *coralogix.HTTPStatusError
+	if errors.As(err, &statusErr) {
+		if isConfigLevelStatus(statusErr.Code) {
+			return report.MetricSeriesFetchFailure{}, false
+		}
+		failure.Category = report.SeriesFailureServerError
+		failure.Reason = fmt.Sprintf("Coralogix answered the /api/v1/series query for this metric with %s — commonly what the series endpoint does for a metric it cannot enumerate in the requested window. Reduce --series-lookback-hours to retry it, or treat this metric as unanalyzable.", statusErr.Status)
+		return failure, true
+	}
+
+	failure.Category = report.SeriesFailureTransport
+	failure.Reason = fmt.Sprintf("the /api/v1/series query for this metric failed: %s. The metric is excluded from the scan; everything else was scanned normally.", firstLine(err))
+	return failure, true
+}
+
+// isConfigLevelStatus reports whether an HTTP status means the request was rejected on its own
+// terms (credentials, permissions, URL, query syntax) rather than the server struggling with
+// one metric. These are identical for every metric, so the scan aborts instead of skipping.
+func isConfigLevelStatus(code int) bool {
+	switch code {
+	case http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusPaymentRequired,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusMethodNotAllowed:
+		return true
+	}
+	return false
 }
 
 func truncate(s string, max int) string {
@@ -459,6 +541,19 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max-1] + "…"
+}
+
+// firstLine reduces an error to its leading line, trimmed — client errors carry a multi-line
+// curl replication block that would otherwise bloat every failure Reason in the report.
+func firstLine(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return truncate(strings.TrimSpace(s), 200)
 }
 
 // omitCoralogixInternalMetricNames drops Coralogix-internal "__name__" values (prefix "cx_") before we

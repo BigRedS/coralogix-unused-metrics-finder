@@ -3,16 +3,35 @@ package coralogix
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/region"
 )
+
+// HTTPStatusError is a non-2xx response from the Coralogix API. It carries the status code so
+// callers can tell a failure of one request (5xx, 429, gateway timeout) from a failure of the
+// whole configuration (401, 403, 400) without matching on message text. Error() keeps the
+// original "<status>\n\n<replication block>" shape so diagnostics are unchanged.
+type HTTPStatusError struct {
+	Code   int
+	Status string
+	Detail string
+}
+
+func (e *HTTPStatusError) Error() string {
+	if e.Detail == "" {
+		return e.Status
+	}
+	return e.Status + "\n\n" + e.Detail
+}
 
 // SeriesAnalysisLimitError is returned by FetchSeriesForMetric when Coralogix rejects the
 // /api/v1/series query with HTTP 422 ViolationTypeTotalSeriesAnalyzed — i.e. the metric has
@@ -29,6 +48,22 @@ func (e *SeriesAnalysisLimitError) Error() string {
 
 func (e *SeriesAnalysisLimitError) Unwrap() error { return e.Cause }
 
+// SeriesTimeoutError is returned by FetchSeriesForMetric when the /api/v1/series query ran
+// out of time instead of producing an answer: the HTTP client timeout fired, the request
+// deadline expired, or an upstream gateway gave up (408/504). Metrics with enormous series
+// counts do this reliably, so callers can record the metric as unanalyzable and carry on
+// with the rest of the scan rather than failing the whole run.
+type SeriesTimeoutError struct {
+	MetricName string
+	Cause      error
+}
+
+func (e *SeriesTimeoutError) Error() string {
+	return fmt.Sprintf("series query timed out for metric %q: %v", e.MetricName, e.Cause)
+}
+
+func (e *SeriesTimeoutError) Unwrap() error { return e.Cause }
+
 // isSeriesAnalysisLimit detects the server-side per-query series cap from the error message
 // produced by c.get. The diagnostic body (included in the wrapped error) carries the
 // ViolationTypeTotalSeriesAnalyzed marker.
@@ -41,6 +76,28 @@ func isSeriesAnalysisLimit(err error) bool {
 		return true
 	}
 	return strings.Contains(s, "422") && strings.Contains(s, "series limit")
+}
+
+// isTimeout reports whether err is a "ran out of time" failure rather than a definitive
+// answer from the server. Covers request/client deadlines (net.Error.Timeout, and the
+// http.Client.Timeout error which does not always wrap context.DeadlineExceeded) plus the
+// HTTP statuses a gateway returns when it stops waiting on Coralogix.
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var timeouter interface{ Timeout() bool }
+	if errors.As(err, &timeouter) && timeouter.Timeout() {
+		return true
+	}
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.Code == http.StatusGatewayTimeout || statusErr.Code == http.StatusRequestTimeout
+	}
+	return strings.Contains(err.Error(), "Client.Timeout exceeded")
 }
 
 type Client struct {
@@ -96,7 +153,11 @@ func (c *Client) get(ctx context.Context, rawURL string, query url.Values) ([]by
 			diagBody = append(diagBody, []byte(fmt.Sprintf(
 				"\n... truncated after %d bytes (response body may be larger)", maxDiagnosticBody))...)
 		}
-		return nil, fmt.Errorf("%s\n\n%s", resp.Status, formatHTTPReplication(req, resp, diagBody))
+		return nil, &HTTPStatusError{
+			Code:   resp.StatusCode,
+			Status: resp.Status,
+			Detail: formatHTTPReplication(req, resp, diagBody),
+		}
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -234,6 +295,11 @@ func (c *Client) FetchSeriesForMetric(ctx context.Context, metricName string, st
 	if err != nil {
 		if isSeriesAnalysisLimit(err) {
 			return nil, false, &SeriesAnalysisLimitError{MetricName: metricName, Cause: err}
+		}
+		// Don't label a cancelled/expired caller context as a per-metric timeout — that's
+		// scan-wide and the caller must not swallow it.
+		if ctx.Err() == nil && isTimeout(err) {
+			return nil, false, &SeriesTimeoutError{MetricName: metricName, Cause: err}
 		}
 		return nil, false, err
 	}
