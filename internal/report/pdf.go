@@ -91,6 +91,17 @@ func writePDFScanSettings(pdf *fpdf.Fpdf, r *Report) {
 	if r.Meta.UsageBillingUTCStartDate != "" || r.Meta.UsageBillingUTCEndDate != "" {
 		rows = append(rows, [2]string{"Billing dates (UTC)", fmt.Sprintf("%s -> %s", r.Meta.UsageBillingUTCStartDate, r.Meta.UsageBillingUTCEndDate)})
 	}
+	if r.Meta.BillingMetricLookupsAttempted > 0 {
+		coverage := fmt.Sprintf("%.0f%% (%d of %d metric lookups succeeded)",
+			r.BillingCoverage()*100, r.Meta.BillingMetricLookupsSucceeded, r.Meta.BillingMetricLookupsAttempted)
+		switch {
+		case r.Meta.BillingPartialAccepted && r.BillingCoverage() < BillingCoverageThreshold:
+			coverage += " - partial data accepted via --billing-allow-partial; cost figures understate the total"
+		case !r.BillingCoverageSufficient():
+			coverage += fmt.Sprintf(" - below the %.0f%% needed to report cost", BillingCoverageThreshold*100)
+		}
+		rows = append(rows, [2]string{"Billing coverage", coverage})
+	}
 	if r.Meta.MetricsTruncatedAtSeriesLimit > 0 {
 		rows = append(rows, [2]string{"Metrics hit per-metric series cap", fmt.Sprintf("%d (catalog possibly incomplete)", r.Meta.MetricsTruncatedAtSeriesLimit)})
 	}
@@ -153,13 +164,17 @@ func writePDFScanSettings(pdf *fpdf.Fpdf, r *Report) {
 // billing data prints "0" for every cost and saving, which reads as a measurement of zero cost
 // rather than an absence of data — the worst possible confusion in a customer-facing report.
 func costCell(r *Report, formatted string) string {
-	if r.HasBillingData() {
+	if r.BillingCostReportable() {
 		return formatted
 	}
-	if r.BillingRequested() {
-		return "unavailable - billing lookup returned no data"
+	if !r.HasBillingData() {
+		if r.BillingRequested() {
+			return "unavailable - billing lookup returned no data"
+		}
+		return "not collected - run with --billing"
 	}
-	return "not collected - run with --billing"
+	return fmt.Sprintf("withheld - billing covered only %.0f%% of metrics (need %.0f%%)",
+		r.BillingCoverage()*100, BillingCoverageThreshold*100)
 }
 
 func writePDFHeadline(pdf *fpdf.Fpdf, r *Report, byMetric []UnusedByMetricRow, plan OTELProcessorPlan) {

@@ -26,6 +26,13 @@ type Meta struct {
 	UsageBillingCalendarMonths          int    `json:"usage_billing_calendar_months,omitempty"` // >0 means window came from last N complete UTC months (not rolling days).
 	SeriesWithBillingData               int    `json:"series_with_billing_data,omitempty"`
 	UnusedSeriesWithBilling             int    `json:"unused_series_with_billing,omitempty"`
+	// BillingMetricLookupsAttempted/Succeeded record how much of the billing pass worked. Their
+	// ratio is the coverage guarding every cost figure — see BillingCoverageThreshold.
+	BillingMetricLookupsAttempted int `json:"billing_metric_lookups_attempted,omitempty"`
+	BillingMetricLookupsSucceeded int `json:"billing_metric_lookups_succeeded,omitempty"`
+	// BillingPartialAccepted records that cost figures were reported despite coverage below the
+	// threshold, because the caller asked for them anyway (--billing-allow-partial).
+	BillingPartialAccepted bool `json:"billing_partial_accepted,omitempty"`
 	// SeriesFetchFailuresCount counts metric names whose /api/v1/series query never returned a
 	// catalog — rejected by the server-side per-query series-analysis cap, or timed out. Those
 	// metrics are absent from the catalog and therefore from used/unused/OTEL outputs.
@@ -151,11 +158,47 @@ type Report struct {
 	BillingSplitCountBySeries map[string]int `json:"-"`
 }
 
+// BillingCoverageThreshold is the fraction of per-metric billing lookups that must succeed
+// before cost figures are reported as fact.
+//
+// Coverage matters more than it looks: a metric whose lookup failed contributes no usage, so it
+// appears to cost nothing. Every cost ranking then sorts the unmeasured metrics to the bottom
+// and understates the total — a partial answer that reads exactly like a complete one. Below
+// this threshold the cost outputs are withheld unless the caller opts in explicitly.
+const BillingCoverageThreshold = 0.90
+
 // HasBillingData reports whether any series carries CX billing figures. False both when billing
 // was never requested (--billing off) and when the lookup returned nothing — in either case no
 // cost figure in this report is a measurement.
 func (r *Report) HasBillingData() bool {
 	return r.Meta.SeriesWithBillingData > 0
+}
+
+// BillingCoverage is the fraction (0..1) of attempted per-metric billing lookups that succeeded,
+// or 0 when none were attempted.
+func (r *Report) BillingCoverage() float64 {
+	if r.Meta.BillingMetricLookupsAttempted <= 0 {
+		return 0
+	}
+	return float64(r.Meta.BillingMetricLookupsSucceeded) / float64(r.Meta.BillingMetricLookupsAttempted)
+}
+
+// BillingCoverageSufficient reports whether cost figures can be presented as fact: coverage at
+// or above BillingCoverageThreshold, or the caller having accepted partial data. Reports with no
+// recorded attempts make no coverage claim, so there is nothing to fail.
+func (r *Report) BillingCoverageSufficient() bool {
+	if r.Meta.BillingPartialAccepted {
+		return true
+	}
+	if r.Meta.BillingMetricLookupsAttempted <= 0 {
+		return true
+	}
+	return r.BillingCoverage() >= BillingCoverageThreshold
+}
+
+// BillingCostReportable reports whether cost figures and cost-ranked outputs should be produced.
+func (r *Report) BillingCostReportable() bool {
+	return r.HasBillingData() && r.BillingCoverageSufficient()
 }
 
 // BillingRequested reports whether a billing window was queried at all, which is what separates
@@ -269,11 +312,12 @@ func (r *Report) Write(outputDir, filenamePrefix string) ([]string, error) {
 	}
 	costRows := unusedRowsFromSeries(unusedByCost, splitN)
 
-	// The per-series cost files are the largest outputs by far, and with no billing data they
-	// carry none: every cost column is empty and the "by cost" ordering degrades to the series
-	// name, making them a bulky duplicate of metric_usage_unused_series.json. Skip them rather
-	// than hand over gigabytes of zeroes that read like measured savings.
-	if r.HasBillingData() {
+	// The per-series cost files are the largest outputs by far, and without trustworthy billing
+	// they carry nothing worth the bytes: with no data at all every cost column is empty and the
+	// "by cost" ordering degrades to the series name, and with partial coverage the ordering is
+	// actively wrong, since unmeasured metrics look free. Skip them rather than hand over
+	// gigabytes that read like measured savings.
+	if r.BillingCostReportable() {
 		byCostName, byCostPath := join("metric_usage_unused_by_cost.json")
 		if err := writeJSONArrayFile(byCostPath, costRows); err != nil {
 			return nil, err

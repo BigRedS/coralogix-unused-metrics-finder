@@ -102,6 +102,7 @@ func run() int {
 	timeoutSec := flag.Int("timeout-sec", 120, "HTTP client timeout per request")
 	grpcHostFlag := flag.String("grpc-host", "", "override the gRPC endpoint for billing and team lookup (default: ng-api-grpc.<domain> derived from --region)")
 	billing := flag.Bool("billing", false, "fetch CX billing data (unit_usage/bytes_volume per series) and write the cost-ranked outputs; off by default because those per-series files are large and the lookup is slow")
+	billingAllowPartial := flag.Bool("billing-allow-partial", false, "with --billing: report cost figures even when fewer than 90% of metric lookups succeed. Off by default because unmeasured metrics look free, so partial figures understate cost and mis-rank metrics")
 	usageDays := flag.Int("usage-lookback-days", 7, "with --billing: rolling inclusive UTC calendar days ending today for CX unit_usage (ignored without --billing)")
 	usageMonths := flag.Int("usage-billing-calendar-months", 0, "if >0, CX unit_usage window is the last N complete UTC calendar months (overrides rolling days when both set); 0 uses rolling days only")
 	skipBilling := flag.Bool("skip-billing", false, "deprecated and no longer needed: billing is off unless --billing is given; when set it forces billing off")
@@ -181,6 +182,7 @@ func run() int {
 		UsageLookbackDays:          usageLookbackDays,
 		UsageBillingCalendarMonths: usageBillingMonths,
 		Billing:                    billingClient,
+		BillingAllowPartial:        *billingAllowPartial,
 		Quiet:                      *quiet,
 		SkipDashboards:             *skipDashboards,
 		SkipAlerts:                 *skipAlerts,
@@ -220,6 +222,17 @@ func run() int {
 		m.UnusedSeriesWithBilling,
 		m.CoralogixInternalMetricNamesSkipped,
 	)
+	if m.BillingMetricLookupsAttempted > 0 {
+		fmt.Fprintf(os.Stderr, "CX billing coverage: %.0f%% (%d of %d metric lookups succeeded).\n",
+			rep.BillingCoverage()*100, m.BillingMetricLookupsSucceeded, m.BillingMetricLookupsAttempted)
+		switch {
+		case m.BillingPartialAccepted:
+			fmt.Fprintln(os.Stderr, "         Cost figures are a LOWER BOUND (--billing-allow-partial): metrics whose lookup failed contribute nothing and appear free.")
+		case !rep.BillingCoverageSufficient():
+			fmt.Fprintf(os.Stderr, "         Below %.0f%%, so cost figures and the cost-ranked files are withheld. Re-run to retry, or pass --billing-allow-partial to accept them as a lower bound.\n",
+				report.BillingCoverageThreshold*100)
+		}
+	}
 	if m.MetricsTruncatedAtSeriesLimit > 0 {
 		fmt.Fprintf(os.Stderr,
 			"Warning: %d metric(s) hit the per-metric series limit; unused list may be incomplete.\n",

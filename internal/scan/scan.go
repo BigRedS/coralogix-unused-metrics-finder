@@ -32,6 +32,10 @@ type Options struct {
 	UsageBillingCalendarMonths int
 	// Billing queries Metrics Usage API; nil skips billing even if UsageLookbackDays > 0.
 	Billing *metricusage.Client
+	// BillingAllowPartial reports cost figures even when billing coverage is below
+	// report.BillingCoverageThreshold. Off by default: partial coverage silently understates the
+	// cost of every metric whose lookup failed, which biases every cost ranking downward.
+	BillingAllowPartial bool
 	// Status receives progress updates; nil uses a stderr status line.
 	Status io.Writer
 	// Quiet disables the status line entirely.
@@ -381,6 +385,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 	billingInclusiveDays := opt.UsageLookbackDays
 	billingCalMonths := opt.UsageBillingCalendarMonths
 
+	billingAttempted, billingSucceeded := 0, 0
 	billingEnabled := opt.Billing != nil && (opt.UsageLookbackDays > 0 || opt.UsageBillingCalendarMonths > 0)
 	if !billingEnabled {
 		warnings.Add("CX billing data not collected (--billing off): no unit_usage, bytes_volume or sample_count figures anywhere in this report, and no cost-ranked outputs. Which series are unused is unaffected — only their cost is unknown.")
@@ -398,7 +403,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 			} else {
 				setStatus(fmt.Sprintf("fetching CX unit usage (%d UTC days)…", billingInclusiveDays))
 			}
-			raw, splitCounts, failures, err := opt.Billing.EnrichCatalog(ctx, catalogSeries, metricNames, startDay, endDay, opt.Workers, func(done, total int, metric string) {
+			enriched, err := opt.Billing.EnrichCatalog(ctx, catalogSeries, metricNames, startDay, endDay, opt.Workers, func(done, total int, metric string) {
 				setStatus(fmt.Sprintf("billing %d/%d — %s", done, total, truncate(metric, 40)))
 			})
 			if err != nil {
@@ -406,17 +411,43 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 			} else {
 				// One warning per failed metric would repeat the same message thousands of times
 				// when the cause is the connection rather than the metric; AddFor folds them.
-				for _, f := range failures {
+				for _, f := range enriched.Failures {
 					warnings.AddFor("billing lookup failed", "metric", f.MetricName, f.Err.Error())
 				}
-				for k, u := range raw {
+				for k, u := range enriched.BySeries {
 					billingBySeries[k] = toReportBilling(u)
 				}
-				billingSplitBySeries = splitCounts
+				billingSplitBySeries = enriched.SplitCount
+				billingAttempted = enriched.Attempted
+				billingSucceeded = enriched.Succeeded()
 			}
-			if len(billingBySeries) == 0 {
-				warnings.Add("CX billing was requested but returned no usable data: no unit_usage, bytes_volume or sample_count figures anywhere in this report, and no cost-ranked outputs. Cost figures are missing, not zero. Which series are unused is unaffected.")
-			}
+		}
+	}
+
+	// Coverage decides whether cost figures are reported at all: a metric whose lookup failed
+	// contributes no usage and so looks free, which drags every cost ranking downward.
+	billingPartialAccepted := false
+	if billingEnabled {
+		coverage := 1.0
+		if billingAttempted > 0 {
+			coverage = float64(billingSucceeded) / float64(billingAttempted)
+		}
+		switch {
+		case len(billingBySeries) == 0:
+			warnings.Add("CX billing was requested but returned no usable data: no unit_usage, bytes_volume or sample_count figures anywhere in this report, and no cost-ranked outputs. Cost figures are missing, not zero. Which series are unused is unaffected.")
+		case coverage >= report.BillingCoverageThreshold:
+			// Complete enough to report as fact; nothing to warn about.
+		case opt.BillingAllowPartial:
+			billingPartialAccepted = true
+			warnings.Add(
+				"CX billing covered only %.0f%% of metric lookups (%d of %d) — reported anyway because --billing-allow-partial was given. Every cost figure here is a LOWER BOUND: metrics whose lookup failed contribute nothing and appear free, so cost rankings are biased toward them.",
+				coverage*100, billingSucceeded, billingAttempted,
+			)
+		default:
+			warnings.Add(
+				"CX billing covered only %.0f%% of metric lookups (%d of %d), below the %.0f%% needed to report cost. Cost figures and the cost-ranked outputs are withheld rather than shown understated — the metrics whose lookups failed would appear free. Re-run to retry, or pass --billing-allow-partial to accept the partial figures as a lower bound. Which series are unused is unaffected.",
+				coverage*100, billingSucceeded, billingAttempted, report.BillingCoverageThreshold*100,
+			)
 		}
 	}
 
@@ -483,6 +514,9 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 			UsageBillingUTCEndDate:              billingEndStr,
 			UsageBillingCalendarMonths:          billingCalMonths,
 			SeriesWithBillingData:               len(billingBySeries),
+			BillingMetricLookupsAttempted:       billingAttempted,
+			BillingMetricLookupsSucceeded:       billingSucceeded,
+			BillingPartialAccepted:              billingPartialAccepted,
 			UnusedSeriesWithBilling:             unusedWithBilling,
 			SeriesFetchFailuresCount:            len(seriesFetchFailures),
 			SeriesFetchTimeoutsCount:            seriesFetchTimeouts,
