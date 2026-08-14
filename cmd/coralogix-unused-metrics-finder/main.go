@@ -19,6 +19,15 @@ import (
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/scan"
 )
 
+// firstLine keeps a multi-line cx error to one line so a retry notice stays
+// readable against the progress display.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return strings.TrimSpace(s)
+}
+
 // resolveTeamFilenamePrefix attempts to discover the Coralogix team name attached to
 // the API key and returns a filesystem-safe prefix to prepend to output files. Any
 // failure (PermissionDenied, network, empty response) yields "" so the caller falls
@@ -171,6 +180,11 @@ func run() int {
 		if apiHost != "" {
 			opts = append(opts, cxcli.WithHost(apiHost))
 		}
+		// A retry pause looks like a hung scan otherwise; say why we're waiting.
+		opts = append(opts, cxcli.WithRetryNotify(func(args []string, attempt int, err error) {
+			fmt.Fprintf(os.Stderr, "\ncx %s failed (attempt %d), retrying: %s\n",
+				strings.Join(args, " "), attempt, firstLine(err.Error()))
+		}))
 		client = cxcli.NewClient(*profileFlag, opts...)
 	} else {
 		client = coralogix.NewClient(apiHost, *keyFlag, time.Duration(*timeoutSec)*time.Second)

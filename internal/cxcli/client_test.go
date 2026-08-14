@@ -237,3 +237,153 @@ func TestExecArgsAppendProfileFlags(t *testing.T) {
 
 // Compile-time guarantee that *Client satisfies scan.Source.
 var _ scan.Source = (*Client)(nil)
+
+// flakyRunner fails the first failures[key] calls for a given subcommand with
+// err, then falls through to responses. It models the transient API 500s that
+// `cx alerts get` returns on large tenants.
+type flakyRunner struct {
+	responses map[string][]byte
+	failures  map[string]int
+	err       error
+	calls     map[string]int
+}
+
+func (f *flakyRunner) run(_ context.Context, args ...string) ([]byte, error) {
+	key := strings.Join(args, " ")
+	if f.calls == nil {
+		f.calls = map[string]int{}
+	}
+	f.calls[key]++
+	if f.failures[key] > 0 {
+		f.failures[key]--
+		return nil, f.err
+	}
+	for prefix, body := range f.responses {
+		if strings.HasPrefix(key, prefix) {
+			return body, nil
+		}
+	}
+	return nil, errors.New("no stub for: " + key)
+}
+
+const transientErr = `cx alerts get al-2: exit status 1: API request failed (500): Internal Server Error: Internal error`
+
+// A definition that 500s must be retried, not skipped: dropping it would hide
+// every metric that alert uses and report those metrics as unused.
+func TestFetchAllAlertDefs_RetriesTransientFailure(t *testing.T) {
+	f := &flakyRunner{
+		responses: map[string][]byte{
+			"alerts list":     []byte(`[{"id":"al-1"},{"id":"al-2"}]`),
+			"alerts get al-1": []byte(`{"a":1}`),
+			"alerts get al-2": []byte(`{"b":2}`),
+		},
+		failures: map[string]int{"alerts get al-2": 2},
+		err:      errors.New(transientErr),
+	}
+	c := NewClient("p", WithRunner(f.run), WithRetry(4, 0))
+
+	defs, err := c.FetchAllAlertDefs(context.Background(), 200)
+	if err != nil {
+		t.Fatalf("FetchAllAlertDefs after transient failures: %v", err)
+	}
+	if len(defs) != 2 {
+		t.Fatalf("got %d defs, want 2 — a retried alert must not be dropped", len(defs))
+	}
+	if got := f.calls["alerts get al-2"]; got != 3 {
+		t.Fatalf("alerts get al-2 called %d times, want 3 (2 failures + 1 success)", got)
+	}
+	if id := coralogix.AlertID(defs[1]); id != "al-2" {
+		t.Fatalf("AlertID(defs[1]) = %q, want al-2", id)
+	}
+}
+
+// If retries are exhausted the scan must abort. Returning the alerts that did
+// succeed would silently under-report usage, which is the failure mode the
+// whole tool exists to avoid.
+func TestFetchAllAlertDefs_AbortsWhenRetriesExhausted(t *testing.T) {
+	f := &flakyRunner{
+		responses: map[string][]byte{
+			"alerts list":     []byte(`[{"id":"al-1"},{"id":"al-2"}]`),
+			"alerts get al-1": []byte(`{"a":1}`),
+		},
+		failures: map[string]int{"alerts get al-2": 99},
+		err:      errors.New(transientErr),
+	}
+	c := NewClient("p", WithRunner(f.run), WithRetry(3, 0))
+
+	defs, err := c.FetchAllAlertDefs(context.Background(), 200)
+	if err == nil {
+		t.Fatal("expected an error once retries are exhausted, got nil")
+	}
+	if defs != nil {
+		t.Fatalf("expected no partial definitions on abort, got %d", len(defs))
+	}
+	if !strings.Contains(err.Error(), "al-2") {
+		t.Fatalf("error should name the failing alert, got %q", err)
+	}
+	if got := f.calls["alerts get al-2"]; got != 3 {
+		t.Fatalf("alerts get al-2 called %d times, want 3 attempts", got)
+	}
+}
+
+// A misconfigured profile is not worth four backoffs — fail on the first answer.
+func TestRunRetrying_FailsFastOnPermanentError(t *testing.T) {
+	f := &flakyRunner{
+		responses: map[string][]byte{"alerts list": []byte(`[]`)},
+		failures:  map[string]int{"alerts list": 99},
+		err:       errors.New("cx alerts list: exit status 1: Configuration error: Profile 'nope' not found"),
+	}
+	c := NewClient("nope", WithRunner(f.run), WithRetry(4, time.Minute))
+
+	if _, err := c.FetchAllAlertDefs(context.Background(), 200); err == nil {
+		t.Fatal("expected an error for a missing profile")
+	}
+	if got := f.calls["alerts list"]; got != 1 {
+		t.Fatalf("alerts list called %d times, want 1 (no retries on a config error)", got)
+	}
+}
+
+func TestIsRetryable(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want bool
+	}{
+		{"API request failed (500): Internal Server Error", true},
+		{"API request failed (503): Service Unavailable", true},
+		{"context deadline exceeded", true},
+		{"Configuration error: Profile 'x' not found", false},
+		{"API request failed (401): Unauthorized", false},
+		{"API request failed (404): Not Found", false},
+	}
+	for _, tc := range cases {
+		if got := isRetryable(errors.New(tc.msg)); got != tc.want {
+			t.Errorf("isRetryable(%q) = %v, want %v", tc.msg, got, tc.want)
+		}
+	}
+}
+
+// A cancelled scan must not sit through the remaining backoff.
+func TestRunRetrying_HonoursContextCancellation(t *testing.T) {
+	f := &flakyRunner{
+		failures: map[string]int{"alerts list": 99},
+		err:      errors.New(transientErr),
+	}
+	c := NewClient("p", WithRunner(f.run), WithRetry(5, time.Hour))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.runRetrying(ctx, "alerts", "list")
+		done <- err
+	}()
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runRetrying did not return promptly after cancellation")
+	}
+}

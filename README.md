@@ -104,6 +104,8 @@ cx profiles add my-team        # one-time OAuth login
 
 The `cx` binary must be on `PATH`. Each `cx` invocation is bounded by `--timeout-sec` (default 120s); a metric whose series query exceeds it is recorded as unanalyzable and skipped.
 
+**Definition fetches retry rather than skip.** The CLI has no bulk endpoint for alert or SLO definitions, so profile mode issues one `cx <res> get` per resource — thousands of calls on a large tenant, where a transient API `500` on some individual call is close to inevitable. Those calls are retried four times with doubling backoff (2s, 4s, 8s), and the scan **aborts** if a definition is still unreachable. It deliberately does not skip the resource the way an unanalyzable metric is skipped: an alert the scan never read is a place a metric might be in use, so dropping it would report metrics as unused that aren't — the one answer this tool must not get wrong. Errors that retrying cannot fix (bad profile, `401`/`403`/`404`) fail immediately.
+
 **Billing is hybrid.** The CLI has no per-metric usage surface, so cost columns (`unit_usage`, `bytes_volume`, cardinality, `$` savings) are blank in profile mode **unless** you also pass **`--billing`** together with **`--key`** (and **`--region`**); the tool then runs the gRPC Metrics Usage path for cost data while everything else goes through the CLI. `--billing` without a key warns and continues without cost data.
 
 **Limitations in CLI mode:**
