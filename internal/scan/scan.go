@@ -75,7 +75,7 @@ func billingWindowUTC(now time.Time, lookbackDays, calendarMonths int) (startDay
 	return startDay, endDay, lookbackDays, nil
 }
 
-func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Report, error) {
+func Run(ctx context.Context, client Source, opt Options) (*report.Report, error) {
 	if opt.Workers <= 0 {
 		opt.Workers = 8
 	}
@@ -105,6 +105,12 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 		}
 	}
 
+	setBar := func(label string, done, total int, suffix string) {
+		if st != nil {
+			st.Bar(label, done, total, suffix)
+		}
+	}
+
 	warnings := newWarningSet()
 	resources := make(map[string]map[string]resourceRef)
 
@@ -126,7 +132,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 				continue
 			}
 			dashDone++
-			setStatus(fmt.Sprintf("dashboards %d/%d — %s", dashDone, dashTotal, truncate(item.Name, 50)))
+			setBar("dashboards", dashDone, dashTotal, truncate(item.Name, 50))
 			raw, err := client.FetchDashboard(ctx, item.ID)
 			if err != nil {
 				warnings.AddFor("dashboard fetch failed", "dashboard", item.ID, err.Error())
@@ -205,7 +211,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 	g, gctx := errgroup.WithContext(ctx)
 	sem := make(chan struct{}, opt.Workers)
 
-	setStatus(fmt.Sprintf("metrics 0/%d — fetching series…", metricsTotal))
+	setBar("metrics", 0, int(metricsTotal), "fetching series…")
 
 	for _, mname := range metricNames {
 		mname := mname
@@ -231,10 +237,8 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 				seriesFetchFailures = append(seriesFetchFailures, failure)
 				mu.Unlock()
 				done := metricsDone.Add(1)
-				setStatus(fmt.Sprintf(
-					"metrics %d/%d — %s on %s (skipped)",
-					done, metricsTotal, failure.Category, truncate(mname, 40),
-				))
+				setBar("metrics", int(done), int(metricsTotal),
+					fmt.Sprintf("%s on %s (skipped)", failure.Category, truncate(mname, 30)))
 				return nil
 			}
 			// Intern outside the catalog lock: the table has its own (sharded) locking, and
@@ -255,10 +259,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 			mu.Unlock()
 
 			done := metricsDone.Add(1)
-			setStatus(fmt.Sprintf(
-				"metrics %d/%d — %d series — %s",
-				done, metricsTotal, seriesCount, truncate(mname, 40),
-			))
+			setBar("metrics", int(done), int(metricsTotal), fmt.Sprintf("%d series · %s", seriesCount, truncate(mname, 30)))
 			return nil
 		})
 	}
@@ -404,7 +405,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 				setStatus(fmt.Sprintf("fetching CX unit usage (%d UTC days)…", billingInclusiveDays))
 			}
 			enriched, err := opt.Billing.EnrichCatalog(ctx, catalogSeries, metricNames, startDay, endDay, opt.Workers, func(done, total int, metric string) {
-				setStatus(fmt.Sprintf("billing %d/%d — %s", done, total, truncate(metric, 40)))
+				setBar("billing", done, total, truncate(metric, 40))
 			})
 			if err != nil {
 				warnings.Add("billing units: %s", err.Error())
@@ -499,7 +500,7 @@ func Run(ctx context.Context, client *coralogix.Client, opt Options) (*report.Re
 
 	return &report.Report{
 		Meta: report.Meta{
-			APIHost:                             client.APIHost,
+			APIHost:                             client.Host(),
 			SeriesLookbackSeconds:               int(opt.SeriesLookback.Seconds()),
 			SeriesLimitPerMetric:                opt.SeriesLimitPerMetric,
 			DashboardsScanned:                   len(dashboards),

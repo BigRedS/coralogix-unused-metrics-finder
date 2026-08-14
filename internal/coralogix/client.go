@@ -123,6 +123,10 @@ func NewClient(apiHost, apiKey string, timeout time.Duration) *Client {
 	}
 }
 
+// Host returns the API host, used in report metadata. It lets *Client satisfy
+// the scan.Source interface alongside the cx-CLI-backed client.
+func (c *Client) Host() string { return c.APIHost }
+
 func (c *Client) get(ctx context.Context, rawURL string, query url.Values) ([]byte, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
