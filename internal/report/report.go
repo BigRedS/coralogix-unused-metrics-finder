@@ -1,9 +1,10 @@
 package report
 
 import (
-	"encoding/json"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 type Meta struct {
@@ -25,15 +26,76 @@ type Meta struct {
 	UsageBillingCalendarMonths          int    `json:"usage_billing_calendar_months,omitempty"` // >0 means window came from last N complete UTC months (not rolling days).
 	SeriesWithBillingData               int    `json:"series_with_billing_data,omitempty"`
 	UnusedSeriesWithBilling             int    `json:"unused_series_with_billing,omitempty"`
-	// SeriesFetchFailuresCount counts metric names whose /api/v1/series query was rejected
-	// by Coralogix (typically the server-side per-query series-analysis cap). Those metrics
-	// are absent from the catalog and therefore from used/unused/OTEL outputs.
+	// BillingMetricLookupsAttempted/Succeeded record how much of the billing pass worked. Their
+	// ratio is the coverage guarding every cost figure — see BillingCoverageThreshold.
+	BillingMetricLookupsAttempted int `json:"billing_metric_lookups_attempted,omitempty"`
+	BillingMetricLookupsSucceeded int `json:"billing_metric_lookups_succeeded,omitempty"`
+	// BillingPartialAccepted records that cost figures were reported despite coverage below the
+	// threshold, because the caller asked for them anyway (--billing-allow-partial).
+	BillingPartialAccepted bool `json:"billing_partial_accepted,omitempty"`
+	// SeriesFetchFailuresCount counts metric names whose /api/v1/series query never returned a
+	// catalog — rejected by the server-side per-query series-analysis cap, or timed out. Those
+	// metrics are absent from the catalog and therefore from used/unused/OTEL outputs.
 	SeriesFetchFailuresCount int `json:"series_fetch_failures_count,omitempty"`
+	// SeriesFetchTimeoutsCount is the subset of SeriesFetchFailuresCount that timed out rather
+	// than being refused outright. A higher --timeout-sec or shorter lookback may recover them.
+	SeriesFetchTimeoutsCount int `json:"series_fetch_timeouts_count,omitempty"`
+	// DistinctLabelStringsRetained is how many distinct label names and values the catalog holds
+	// after interning. Compare with distinct_series_in_catalog to judge the scan's memory needs:
+	// the catalog retains one copy of each of these, not one per series.
+	DistinctLabelStringsRetained int `json:"distinct_label_strings_retained,omitempty"`
 }
 
-// MetricSeriesFetchFailure records a metric whose catalog series fetch was rejected by Coralogix.
+// Series fetch failure categories (MetricSeriesFetchFailure.Category).
+const (
+	// SeriesFailureAnalysisCap — Coralogix refused the query outright (ViolationTypeTotalSeriesAnalyzed).
+	SeriesFailureAnalysisCap = "series_analysis_cap"
+	// SeriesFailureTimeout — the query ran past the request timeout without answering.
+	SeriesFailureTimeout = "timeout"
+	// SeriesFailureServerError — Coralogix answered with a server error (typically 500) for this metric.
+	SeriesFailureServerError = "server_error"
+	// SeriesFailureTransport — the request failed before/outside an HTTP status (connection reset, bad body).
+	SeriesFailureTransport = "transport"
+)
+
+// SeriesFetchFailureCounts tallies failures by category, e.g. {"timeout": 3, "server_error": 1}.
+func SeriesFetchFailureCounts(failures []MetricSeriesFetchFailure) map[string]int {
+	counts := make(map[string]int, 4)
+	for _, f := range failures {
+		cat := f.Category
+		if cat == "" {
+			cat = "unknown"
+		}
+		counts[cat]++
+	}
+	return counts
+}
+
+// SeriesFetchFailureBreakdown renders SeriesFetchFailureCounts as a stable, readable list
+// ("2 timeout, 1 server_error") for warnings, CLI output and the PDF.
+func SeriesFetchFailureBreakdown(failures []MetricSeriesFetchFailure) string {
+	counts := SeriesFetchFailureCounts(failures)
+	cats := make([]string, 0, len(counts))
+	for cat := range counts {
+		cats = append(cats, cat)
+	}
+	sort.Slice(cats, func(i, j int) bool {
+		if counts[cats[i]] != counts[cats[j]] {
+			return counts[cats[i]] > counts[cats[j]]
+		}
+		return cats[i] < cats[j]
+	})
+	parts := make([]string, 0, len(cats))
+	for _, cat := range cats {
+		parts = append(parts, strconv.Itoa(counts[cat])+" "+cat)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// MetricSeriesFetchFailure records a metric whose catalog series fetch did not produce a result.
 type MetricSeriesFetchFailure struct {
 	MetricName string `json:"metric_name"`
+	Category   string `json:"category,omitempty"`
 	Reason     string `json:"reason"`
 }
 
@@ -86,14 +148,63 @@ type Report struct {
 	ReferencedSelectorsWithoutMetricName               []SelectorRefIssue `json:"referenced_selectors_without_metric_name"`
 	ReferencedSelectorsMetricAbsentInTimeseriesWindow  []SelectorRefIssue `json:"referenced_selectors_metric_absent_in_timeseries_window"`
 	ReferencedSelectorsMetricPresentButNoSeriesMatches []SelectorRefIssue `json:"referenced_selectors_metric_present_but_no_series_matches"`
-	// SeriesFetchFailures lists metric names whose catalog could not be fetched (e.g. server-side
-	// series-analysis cap). These metrics are excluded from used/unused classification — their
-	// usage status is unknown rather than confirmed unused.
+	// SeriesFetchFailures lists metric names whose catalog could not be fetched (server-side
+	// series-analysis cap, or the query timing out). These metrics are excluded from used/unused
+	// classification — their usage status is unknown rather than confirmed unused.
 	SeriesFetchFailures []MetricSeriesFetchFailure `json:"series_fetch_failures,omitempty"`
 	Warnings            []string                   `json:"warnings"`
 
 	// BillingSplitCountBySeries records how many catalog series shared one billing variation row (>1 → usage was divided).
 	BillingSplitCountBySeries map[string]int `json:"-"`
+}
+
+// BillingCoverageThreshold is the fraction of per-metric billing lookups that must succeed
+// before cost figures are reported as fact.
+//
+// Coverage matters more than it looks: a metric whose lookup failed contributes no usage, so it
+// appears to cost nothing. Every cost ranking then sorts the unmeasured metrics to the bottom
+// and understates the total — a partial answer that reads exactly like a complete one. Below
+// this threshold the cost outputs are withheld unless the caller opts in explicitly.
+const BillingCoverageThreshold = 0.90
+
+// HasBillingData reports whether any series carries CX billing figures. False both when billing
+// was never requested (--billing off) and when the lookup returned nothing — in either case no
+// cost figure in this report is a measurement.
+func (r *Report) HasBillingData() bool {
+	return r.Meta.SeriesWithBillingData > 0
+}
+
+// BillingCoverage is the fraction (0..1) of attempted per-metric billing lookups that succeeded,
+// or 0 when none were attempted.
+func (r *Report) BillingCoverage() float64 {
+	if r.Meta.BillingMetricLookupsAttempted <= 0 {
+		return 0
+	}
+	return float64(r.Meta.BillingMetricLookupsSucceeded) / float64(r.Meta.BillingMetricLookupsAttempted)
+}
+
+// BillingCoverageSufficient reports whether cost figures can be presented as fact: coverage at
+// or above BillingCoverageThreshold, or the caller having accepted partial data. Reports with no
+// recorded attempts make no coverage claim, so there is nothing to fail.
+func (r *Report) BillingCoverageSufficient() bool {
+	if r.Meta.BillingPartialAccepted {
+		return true
+	}
+	if r.Meta.BillingMetricLookupsAttempted <= 0 {
+		return true
+	}
+	return r.BillingCoverage() >= BillingCoverageThreshold
+}
+
+// BillingCostReportable reports whether cost figures and cost-ranked outputs should be produced.
+func (r *Report) BillingCostReportable() bool {
+	return r.HasBillingData() && r.BillingCoverageSufficient()
+}
+
+// BillingRequested reports whether a billing window was queried at all, which is what separates
+// "not collected" from "collected but empty" when explaining missing cost figures.
+func (r *Report) BillingRequested() bool {
+	return r.Meta.UsageLookbackDays > 0 || r.Meta.UsageBillingCalendarMonths > 0
 }
 
 func SortUsedSeries(s []UsedSeries) {
@@ -180,21 +291,13 @@ func (r *Report) Write(outputDir, filenamePrefix string) ([]string, error) {
 	var written []string
 
 	summaryName, summaryPath := join("metric_usage_summary.json")
-	summary, err := json.MarshalIndent(r, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(summaryPath, summary, 0o644); err != nil {
+	if err := writeSummaryJSON(summaryPath, r); err != nil {
 		return nil, err
 	}
 	written = append(written, summaryName)
 
 	unusedName, unusedPath := join("metric_usage_unused_series.json")
-	unused, err := json.MarshalIndent(r.UnusedSeriesInCatalog, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(unusedPath, unused, 0o644); err != nil {
+	if err := writeJSONArrayFile(unusedPath, r.UnusedSeriesInCatalog); err != nil {
 		return nil, err
 	}
 	written = append(written, unusedName)
@@ -209,29 +312,28 @@ func (r *Report) Write(outputDir, filenamePrefix string) ([]string, error) {
 	}
 	costRows := unusedRowsFromSeries(unusedByCost, splitN)
 
-	byCostName, byCostPath := join("metric_usage_unused_by_cost.json")
-	byCost, err := json.MarshalIndent(costRows, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(byCostPath, byCost, 0o644); err != nil {
-		return nil, err
-	}
-	written = append(written, byCostName)
+	// The per-series cost files are the largest outputs by far, and without trustworthy billing
+	// they carry nothing worth the bytes: with no data at all every cost column is empty and the
+	// "by cost" ordering degrades to the series name, and with partial coverage the ordering is
+	// actively wrong, since unmeasured metrics look free. Skip them rather than hand over
+	// gigabytes that read like measured savings.
+	if r.BillingCostReportable() {
+		byCostName, byCostPath := join("metric_usage_unused_by_cost.json")
+		if err := writeJSONArrayFile(byCostPath, costRows); err != nil {
+			return nil, err
+		}
+		written = append(written, byCostName)
 
-	byCostCSVName, byCostCSVPath := join("metric_usage_unused_by_cost.csv")
-	if err := WriteUnusedByCostCSV(byCostCSVPath, costRows); err != nil {
-		return nil, err
+		byCostCSVName, byCostCSVPath := join("metric_usage_unused_by_cost.csv")
+		if err := WriteUnusedByCostCSV(byCostCSVPath, costRows); err != nil {
+			return nil, err
+		}
+		written = append(written, byCostCSVName)
 	}
-	written = append(written, byCostCSVName)
 
 	byMetric := AggregateUnusedByMetric(costRows)
 	byMetricName, byMetricPath := join("metric_usage_unused_by_metric.json")
-	byMetricJSON, err := json.MarshalIndent(byMetric, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(byMetricPath, byMetricJSON, 0o644); err != nil {
+	if err := writeJSONArrayFile(byMetricPath, byMetric); err != nil {
 		return nil, err
 	}
 	written = append(written, byMetricName)

@@ -15,6 +15,7 @@ import (
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/cxteams"
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/metricusage"
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/region"
+	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/report"
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/scan"
 )
 
@@ -22,8 +23,8 @@ import (
 // the API key and returns a filesystem-safe prefix to prepend to output files. Any
 // failure (PermissionDenied, network, empty response) yields "" so the caller falls
 // back to unprefixed filenames — team-name lookup is a nice-to-have, not required.
-func resolveTeamFilenamePrefix(ctx context.Context, apiHost, apiKey string) string {
-	tc, err := cxteams.NewClient(apiHost, apiKey)
+func resolveTeamFilenamePrefix(ctx context.Context, grpcHost, apiKey string) string {
+	tc, err := cxteams.NewClient(grpcHost, apiKey)
 	if err != nil {
 		return ""
 	}
@@ -95,15 +96,18 @@ func main() {
 func run() int {
 	regionFlag := flag.String("region", "", "Coralogix region or domain (eu1, eu2.coralogix.com, api.eu2.coralogix.com, …)")
 	keyFlag := flag.String("key", "", "Coralogix API key (Bearer)")
-	profileFlag := flag.String("profile", "", "cx CLI profile name (OAuth login). When set, dashboards/alerts/SLOs/metrics are fetched via the `cx` CLI and --key becomes optional. Billing requires --key (+ --region); without it cost columns are blank. Metric-name window filtering is unavailable in CLI mode.")
+	profileFlag := flag.String("profile", "", "cx CLI profile name (OAuth login). When set, dashboards/alerts/SLOs/metrics are fetched via the `cx` CLI and --key becomes optional. Billing requires --billing plus --key (+ --region); without them cost columns are blank. Metric-name window filtering is unavailable in CLI mode.")
 	outputDir := flag.String("output-dir", ".", "directory for report outputs (JSON, CSV per-series + per-metric rollup, OTEL YAML)")
 	lookbackHours := flag.Float64("series-lookback-hours", 25, "time window for Prometheus series discovery")
 	seriesLimit := flag.Int("series-limit-per-metric", 50_000, "max series rows per metric name")
 	workers := flag.Int("workers", 8, "parallel series fetches")
 	timeoutSec := flag.Int("timeout-sec", 120, "HTTP client timeout per request")
-	usageDays := flag.Int("usage-lookback-days", 7, "rolling inclusive UTC calendar days ending today for CX unit_usage (0 skips rolling window; use --usage-billing-calendar-months instead)")
+	grpcHostFlag := flag.String("grpc-host", "", "override the gRPC endpoint for billing and team lookup (default: ng-api-grpc.<domain> derived from --region)")
+	billing := flag.Bool("billing", false, "fetch CX billing data (unit_usage/bytes_volume per series) and write the cost-ranked outputs; off by default because those per-series files are large and the lookup is slow")
+	billingAllowPartial := flag.Bool("billing-allow-partial", false, "with --billing: report cost figures even when fewer than 90% of metric lookups succeed. Off by default because unmeasured metrics look free, so partial figures understate cost and mis-rank metrics")
+	usageDays := flag.Int("usage-lookback-days", 7, "with --billing: rolling inclusive UTC calendar days ending today for CX unit_usage (ignored without --billing)")
 	usageMonths := flag.Int("usage-billing-calendar-months", 0, "if >0, CX unit_usage window is the last N complete UTC calendar months (overrides rolling days when both set); 0 uses rolling days only")
-	skipBilling := flag.Bool("skip-billing", false, "skip Metrics Usage API (no unit_usage on output)")
+	skipBilling := flag.Bool("skip-billing", false, "deprecated and no longer needed: billing is off unless --billing is given; when set it forces billing off")
 	skipDashboards := flag.Bool("skip-dashboards", false, "skip dashboard catalog and definitions (omit Dashboard preset)")
 	skipAlerts := flag.Bool("skip-alerts", false, "skip alert definitions v3 (omit Alerts preset)")
 	skipSLO := flag.Bool("skip-slo", false, "skip SLO list (omit SLO preset)")
@@ -118,6 +122,12 @@ func run() int {
 
 	if *usageDays < 0 || *usageMonths < 0 {
 		fmt.Fprintln(os.Stderr, "usage lookback days and billing calendar months must be non-negative")
+		return 2
+	}
+
+	billingEnabled := *billing && !*skipBilling
+	if billingEnabled && *usageDays == 0 && *usageMonths == 0 {
+		fmt.Fprintln(os.Stderr, "--billing needs a window: set --usage-lookback-days (default 7) or --usage-billing-calendar-months")
 		return 2
 	}
 
@@ -139,6 +149,17 @@ func run() int {
 		}
 	}
 
+	// Billing and team lookup are gRPC, which lives on a different host from the REST API —
+	// region.GRPCHost explains why the REST host cannot be used. In CLI mode --region is
+	// optional, so this stays empty unless one of them supplies a host.
+	grpcHost := ""
+	if apiHost != "" {
+		grpcHost = region.GRPCHost(apiHost)
+	}
+	if *grpcHostFlag != "" {
+		grpcHost = *grpcHostFlag
+	}
+
 	ctx := context.Background()
 
 	var client scan.Source
@@ -155,15 +176,16 @@ func run() int {
 		client = coralogix.NewClient(apiHost, *keyFlag, time.Duration(*timeoutSec)*time.Second)
 	}
 
-	// Billing uses the gRPC Metrics Usage API, which needs an API key and host.
-	// It runs whenever a key is present (always in API mode; opt-in for CLI mode).
+	// Billing uses the gRPC Metrics Usage API, which needs an API key and host of its own.
+	// CLI mode can run without either, so --billing there is only honoured alongside --key.
 	var billingClient *metricusage.Client
-	if !*skipBilling && (*usageDays > 0 || *usageMonths > 0) && *keyFlag != "" {
-		if apiHost == "" {
-			fmt.Fprintln(os.Stderr, "billing requires --region alongside --key; skipping billing (cost columns will be blank)")
+	if billingEnabled {
+		if *keyFlag == "" || grpcHost == "" {
+			fmt.Fprintln(os.Stderr, "--billing needs --key and --region (or --grpc-host); continuing without billing (cost columns will be blank)")
+			billingEnabled = false
 		} else {
 			var err error
-			billingClient, err = metricusage.NewClient(apiHost, *keyFlag)
+			billingClient, err = metricusage.NewClient(grpcHost, *keyFlag)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "billing client:", err)
 				return 1
@@ -174,19 +196,27 @@ func run() int {
 
 	if *debugBillingMetric != "" {
 		if billingClient == nil {
-			fmt.Fprintln(os.Stderr, "--debug-billing-metric requires --usage-lookback-days > 0 (or --usage-billing-calendar-months > 0) and no --skip-billing")
+			fmt.Fprintln(os.Stderr, "--debug-billing-metric requires --billing (with a window: --usage-lookback-days or --usage-billing-calendar-months)")
 			return 2
 		}
 		return runDebugBilling(ctx, billingClient, *debugBillingMetric, *usageDays, *usageMonths)
+	}
+
+	// Without --billing the window flags keep their defaults but must not reach the scan, or it
+	// would report a billing window it never queried.
+	usageLookbackDays, usageBillingMonths := 0, 0
+	if billingEnabled {
+		usageLookbackDays, usageBillingMonths = *usageDays, *usageMonths
 	}
 
 	rep, err := scan.Run(ctx, client, scan.Options{
 		SeriesLookback:             time.Duration(*lookbackHours * float64(time.Hour)),
 		SeriesLimitPerMetric:       *seriesLimit,
 		Workers:                    *workers,
-		UsageLookbackDays:          *usageDays,
-		UsageBillingCalendarMonths: *usageMonths,
+		UsageLookbackDays:          usageLookbackDays,
+		UsageBillingCalendarMonths: usageBillingMonths,
 		Billing:                    billingClient,
+		BillingAllowPartial:        *billingAllowPartial,
 		Quiet:                      *quiet,
 		SkipDashboards:             *skipDashboards,
 		SkipAlerts:                 *skipAlerts,
@@ -200,8 +230,8 @@ func run() int {
 	// Team-name lookup uses the gRPC Teams API (needs key + host); skip it in
 	// CLI mode without a key and fall back to unprefixed filenames.
 	teamPrefix := ""
-	if apiHost != "" && *keyFlag != "" {
-		teamPrefix = resolveTeamFilenamePrefix(ctx, apiHost, *keyFlag)
+	if grpcHost != "" && *keyFlag != "" {
+		teamPrefix = resolveTeamFilenamePrefix(ctx, grpcHost, *keyFlag)
 	}
 	if teamPrefix != "" {
 		fmt.Fprintf(os.Stderr, "Using team-name prefix %q on output files.\n", teamPrefix)
@@ -231,6 +261,17 @@ func run() int {
 		m.UnusedSeriesWithBilling,
 		m.CoralogixInternalMetricNamesSkipped,
 	)
+	if m.BillingMetricLookupsAttempted > 0 {
+		fmt.Fprintf(os.Stderr, "CX billing coverage: %.0f%% (%d of %d metric lookups succeeded).\n",
+			rep.BillingCoverage()*100, m.BillingMetricLookupsSucceeded, m.BillingMetricLookupsAttempted)
+		switch {
+		case m.BillingPartialAccepted:
+			fmt.Fprintln(os.Stderr, "         Cost figures are a LOWER BOUND (--billing-allow-partial): metrics whose lookup failed contribute nothing and appear free.")
+		case !rep.BillingCoverageSufficient():
+			fmt.Fprintf(os.Stderr, "         Below %.0f%%, so cost figures and the cost-ranked files are withheld. Re-run to retry, or pass --billing-allow-partial to accept them as a lower bound.\n",
+				report.BillingCoverageThreshold*100)
+		}
+	}
 	if m.MetricsTruncatedAtSeriesLimit > 0 {
 		fmt.Fprintf(os.Stderr,
 			"Warning: %d metric(s) hit the per-metric series limit; unused list may be incomplete.\n",
@@ -239,9 +280,13 @@ func run() int {
 	}
 	if m.SeriesFetchFailuresCount > 0 {
 		fmt.Fprintf(os.Stderr,
-			"Warning: %d metric(s) skipped — Coralogix refused to analyze that many series in one query; see series_fetch_failures in metric_usage_summary.json. Their usage status is unknown (not 'unused') and they are excluded from the OTEL fragment.\n",
+			"Warning: %d of %d metric(s) skipped — their series catalog could not be retrieved (%s); see series_fetch_failures in metric_usage_summary.json. Their usage status is unknown (not 'unused') and they are excluded from the OTEL fragment.\n",
 			m.SeriesFetchFailuresCount,
+			m.DistinctMetricNames,
+			report.SeriesFetchFailureBreakdown(rep.SeriesFetchFailures),
 		)
+		fmt.Fprintln(os.Stderr,
+			"         A shorter --series-lookback-hours (or a larger --timeout-sec for the timed-out ones) may bring them back into the scan.")
 	}
 	if *skipDashboards || *skipAlerts || *skipSLO {
 		var skipped []string

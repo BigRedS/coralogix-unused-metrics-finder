@@ -12,6 +12,7 @@ import (
 
 	metriccommon "github.com/BigRedS/coralogix-unused-metrics-finder/internal/gen/metriccommon"
 	metricusages "github.com/BigRedS/coralogix-unused-metrics-finder/internal/gen/metricusages"
+	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/region"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/genproto/googleapis/type/date"
 	"google.golang.org/grpc"
@@ -27,16 +28,21 @@ type UnitsUsage struct {
 	DaysInRange int     `json:"days_in_range"`
 }
 
-// Client calls UsageService on api.<region>:443.
+// Client calls UsageService on the regional gRPC endpoint (ng-api-grpc.<domain>:443).
 type Client struct {
-	APIHost string
-	svc     metricusages.UsageServiceClient
-	conn    *grpc.ClientConn
+	// GRPCHost is the host actually dialled, after mapping — worth having in diagnostics,
+	// since it is deliberately not the REST API host.
+	GRPCHost string
+	svc      metricusages.UsageServiceClient
+	conn     *grpc.ClientConn
 }
 
-// NewClient dials the regional Coralogix API host (e.g. api.eu2.coralogix.com).
-func NewClient(apiHost, apiKey string) (*Client, error) {
-	target := apiHost + ":443"
+// NewClient dials the Coralogix gRPC endpoint for host. Pass either the account's API host
+// (api.eu2.coralogix.com) or an explicit gRPC host; region.GRPCHost normalises both, and the
+// REST host is never dialled directly — see its doc comment for why that matters.
+func NewClient(host, apiKey string) (*Client, error) {
+	grpcHost := region.GRPCHost(host)
+	target := grpcHost + ":443"
 	conn, err := grpc.NewClient(
 		target,
 		grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")),
@@ -46,9 +52,9 @@ func NewClient(apiHost, apiKey string) (*Client, error) {
 		return nil, fmt.Errorf("grpc dial %s: %w", target, err)
 	}
 	return &Client{
-		APIHost: apiHost,
-		svc:     metricusages.NewUsageServiceClient(conn),
-		conn:    conn,
+		GRPCHost: grpcHost,
+		svc:      metricusages.NewUsageServiceClient(conn),
+		conn:     conn,
 	}, nil
 }
 
@@ -199,14 +205,41 @@ func splitUsage(u UnitsUsage, n int) UnitsUsage {
 	}
 }
 
+// MetricFetchError is a billing lookup that failed for one metric name.
+type MetricFetchError struct {
+	MetricName string
+	Err        error
+}
+
+func (e MetricFetchError) Error() string {
+	return fmt.Sprintf("%q: %v", e.MetricName, e.Err)
+}
+
+func (e MetricFetchError) Unwrap() error { return e.Err }
+
+// EnrichResult is what one billing pass produced, including how much of it succeeded. Callers
+// need Attempted and Failures to judge coverage: cost figures built from a pass where most
+// lookups failed are biased, because a metric with no data looks free.
+type EnrichResult struct {
+	BySeries   map[string]UnitsUsage
+	SplitCount map[string]int
+	// Attempted counts metric names an RPC was actually issued for — metrics with no catalog
+	// series are skipped without a call and are not counted.
+	Attempted int
+	Failures  []MetricFetchError
+}
+
+// Succeeded is the number of metric lookups that returned without error.
+func (r EnrichResult) Succeeded() int { return r.Attempted - len(r.Failures) }
+
 // EnrichCatalog maps variation-level CX billing onto Prometheus catalog series keys.
 // A CX "variation" is identified by its label-name set: every catalog series whose labels
 // have the same key set as the variation belongs to that variation, and the variation's
 // billed usage is divided evenly across them.
 //
-// Per-metric fetch errors are returned as warnings (one string per failed metric) rather
-// than aborting the whole batch — a single 5xx from CX must not throw away every other
-// metric's billing data. The error return is reserved for the caller's ctx being cancelled.
+// Per-metric fetch errors are collected in EnrichResult.Failures rather than aborting the whole
+// batch — a single 5xx from CX must not throw away every other metric's billing data. The error
+// return is reserved for the caller's ctx being cancelled.
 func (c *Client) EnrichCatalog(
 	ctx context.Context,
 	catalogSeries map[string]map[string]string,
@@ -214,7 +247,7 @@ func (c *Client) EnrichCatalog(
 	startDay, endDay time.Time,
 	workers int,
 	onProgress func(done, total int, metric string),
-) (map[string]UnitsUsage, map[string]int, []string, error) {
+) (EnrichResult, error) {
 	if workers <= 0 {
 		workers = 4
 	}
@@ -230,7 +263,8 @@ func (c *Client) EnrichCatalog(
 
 	result := make(map[string]UnitsUsage)
 	splitCount := make(map[string]int)
-	var warnings []string
+	var failures []MetricFetchError
+	attempted := 0
 	var mu sync.Mutex
 
 	total := len(metricNames)
@@ -257,6 +291,10 @@ func (c *Client) EnrichCatalog(
 				return nil
 			}
 
+			mu.Lock()
+			attempted++
+			mu.Unlock()
+
 			byVar, err := c.FetchVariationUnits(gctx, mname, startDay, endDay)
 			if err != nil {
 				// If the parent ctx is done, bubble the cancellation up so the whole batch stops.
@@ -264,7 +302,7 @@ func (c *Client) EnrichCatalog(
 					return ctx.Err()
 				}
 				mu.Lock()
-				warnings = append(warnings, fmt.Sprintf("%q: %v", mname, err))
+				failures = append(failures, MetricFetchError{MetricName: mname, Err: err})
 				mu.Unlock()
 				if onProgress != nil {
 					onProgress(int(done.Add(1)), total, mname)
@@ -310,9 +348,16 @@ func (c *Client) EnrichCatalog(
 	}
 
 	if err := g.Wait(); err != nil {
-		return nil, nil, nil, err
+		return EnrichResult{}, err
 	}
-	return result, splitCount, warnings, nil
+	// Failures arrive from parallel workers; sort so warnings and reports are stable across runs.
+	sort.Slice(failures, func(i, j int) bool { return failures[i].MetricName < failures[j].MetricName })
+	return EnrichResult{
+		BySeries:   result,
+		SplitCount: splitCount,
+		Attempted:  attempted,
+		Failures:   failures,
+	}, nil
 }
 
 func toProtoDate(t time.Time) *date.Date {

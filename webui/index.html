@@ -46,6 +46,8 @@
     .err { color: #ff8a8a; }
     .ok { color: #8bd58b; }
     input#key.invalid { border-color: #a65d5d; }
+    label.checkbox { display: flex; align-items: center; gap: .5rem; margin-top: 1rem; font-weight: normal; }
+    label.checkbox input { width: auto; margin: 0; }
     footer { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid #2a3440; font-size: 0.8rem; color: #9aa7b2; }
     footer a { color: #7ec8ff; }
     #key-preview {
@@ -72,6 +74,9 @@
   <label for="key">API key</label>
   <input id="key" type="password" autocomplete="off" spellcheck="false" placeholder="cxup_… (35 characters)" />
   <div id="key-preview" class="key-preview" aria-live="polite"></div>
+
+  <label class="checkbox"><input id="billing" type="checkbox" /> Include CX billing data (cost per series)</label>
+  <p class="note">Off by default: the billing lookup is slow and adds the largest files in the download. Without it you still get which series are unused — just not what they cost.</p>
 
   <button id="go" type="button">Run scan</button>
 
@@ -168,6 +173,7 @@
       otelYaml.value = "";
       const region = regionSel.value.trim();
       const api_key = keyInput.value.trim();
+      const billing = document.getElementById("billing").checked;
       if (!api_key) {
         setStatus("Enter an API key.", "err");
         return;
@@ -193,7 +199,7 @@
         const res = await fetch("/api/run", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ region, api_key }),
+          body: JSON.stringify({ region, api_key, billing }),
         });
         const body = await res.json().catch(() => ({}));
         if (!res.ok) {

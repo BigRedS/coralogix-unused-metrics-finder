@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/promqlextract"
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/report"
 	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/status"
+	"github.com/BigRedS/coralogix-unused-metrics-finder/internal/strintern"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -29,6 +32,10 @@ type Options struct {
 	UsageBillingCalendarMonths int
 	// Billing queries Metrics Usage API; nil skips billing even if UsageLookbackDays > 0.
 	Billing *metricusage.Client
+	// BillingAllowPartial reports cost figures even when billing coverage is below
+	// report.BillingCoverageThreshold. Off by default: partial coverage silently understates the
+	// cost of every metric whose lookup failed, which biases every cost ranking downward.
+	BillingAllowPartial bool
 	// Status receives progress updates; nil uses a stderr status line.
 	Status io.Writer
 	// Quiet disables the status line entirely.
@@ -104,13 +111,13 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 		}
 	}
 
-	var warnings []string
+	warnings := newWarningSet()
 	resources := make(map[string]map[string]resourceRef)
 
 	var dashboards []report.DashboardRef
 	resources["dashboard"] = make(map[string]resourceRef)
 	if opt.SkipDashboards {
-		warnings = append(warnings, "skipped dashboards (--skip-dashboards); correlation excludes dashboard PromQL")
+		warnings.Add("skipped dashboards (--skip-dashboards); correlation excludes dashboard PromQL")
 	} else {
 		setStatus("listing dashboard catalog…")
 		catalog, err := client.FetchDashboardCatalog(ctx)
@@ -128,7 +135,7 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 			setBar("dashboards", dashDone, dashTotal, truncate(item.Name, 50))
 			raw, err := client.FetchDashboard(ctx, item.ID)
 			if err != nil {
-				warnings = append(warnings, fmt.Sprintf("dashboard %s: %v", item.ID, err))
+				warnings.AddFor("dashboard fetch failed", "dashboard", item.ID, err.Error())
 				continue
 			}
 			resources["dashboard"][item.ID] = resourceRef{selectors: promqlextract.ExtractFromJSON(raw)}
@@ -139,7 +146,7 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 	var alerts []json.RawMessage
 	resources["alert"] = make(map[string]resourceRef)
 	if opt.SkipAlerts {
-		warnings = append(warnings, "skipped alerts (--skip-alerts); correlation excludes alert PromQL")
+		warnings.Add("skipped alerts (--skip-alerts); correlation excludes alert PromQL")
 	} else {
 		setStatus("fetching alert definitions…")
 		var err error
@@ -160,7 +167,7 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 	var slos []json.RawMessage
 	resources["slo"] = make(map[string]resourceRef)
 	if opt.SkipSLOs {
-		warnings = append(warnings, "skipped SLOs (--skip-slo); correlation excludes SLO PromQL")
+		warnings.Add("skipped SLOs (--skip-slo); correlation excludes SLO PromQL")
 	} else {
 		setStatus("fetching SLOs…")
 		var err error
@@ -179,7 +186,7 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 	}
 
 	if opt.SkipDashboards && opt.SkipAlerts && opt.SkipSLOs {
-		warnings = append(warnings, "all correlation sources skipped; every catalog series will appear unused")
+		warnings.Add("all correlation sources skipped; every catalog series will appear unused")
 	}
 
 	// Metric catalog (parallel series fetch per metric name)
@@ -192,6 +199,10 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 
 	var mu sync.Mutex
 	catalogSeries := make(map[string]map[string]string)
+	// Label names and values repeat across nearly every series; json decoding allocates a fresh
+	// copy of each per series. Interning them is what keeps a multi-million-series catalog inside
+	// available memory — without it the retained label strings dominate the scan's heap.
+	labels := strintern.New()
 	truncatedCount := 0
 	var seriesFetchFailures []report.MetricSeriesFetchFailure
 	metricsTotal := int64(len(metricNames))
@@ -214,20 +225,28 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 
 			series, trunc, err := client.FetchSeriesForMetric(gctx, mname, start, now, opt.SeriesLimitPerMetric)
 			if err != nil {
-				var limitErr *coralogix.SeriesAnalysisLimitError
-				if errors.As(err, &limitErr) {
-					mu.Lock()
-					seriesFetchFailures = append(seriesFetchFailures, report.MetricSeriesFetchFailure{
-						MetricName: mname,
-						Reason:     "Coralogix rejected /api/v1/series with ViolationTypeTotalSeriesAnalyzed — this metric has more time series in the lookback window than the server will analyze in one query. Reduce --series-lookback-hours or treat this metric as unanalyzable.",
-					})
-					mu.Unlock()
-					done := metricsDone.Add(1)
-					setBar("metrics", int(done), int(metricsTotal), "limit hit: "+truncate(mname, 30)+" (skipped)")
-					return nil
+				// A cancelled/expired caller context is scan-wide: stop rather than blaming the metric.
+				if ctx.Err() != nil {
+					return ctx.Err()
 				}
-				return err
+				failure, skip := classifySeriesFetchFailure(mname, err)
+				if !skip {
+					return err
+				}
+				mu.Lock()
+				seriesFetchFailures = append(seriesFetchFailures, failure)
+				mu.Unlock()
+				done := metricsDone.Add(1)
+				setBar("metrics", int(done), int(metricsTotal),
+					fmt.Sprintf("%s on %s (skipped)", failure.Category, truncate(mname, 30)))
+				return nil
 			}
+			// Intern outside the catalog lock: the table has its own (sharded) locking, and
+			// this is the expensive part of absorbing a metric's series.
+			for i, lbls := range series {
+				series[i] = labels.Labels(lbls)
+			}
+
 			mu.Lock()
 			if trunc {
 				truncatedCount++
@@ -248,11 +267,33 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 		return nil, err
 	}
 
+	// The catalog now holds the only references it needs; the intern table's own entries (~50
+	// bytes per distinct string) are pure overhead from here on. Record its size and drop it so
+	// the GC can reclaim the table before the memory-hungry correlation and output phases.
+	labelStringsRetained := labels.Len()
+	labels = nil
+	_ = labels // released deliberately: see above
+
+	// Failures arrive from parallel workers; sort so report output is stable across runs.
+	sort.Slice(seriesFetchFailures, func(i, j int) bool {
+		return seriesFetchFailures[i].MetricName < seriesFetchFailures[j].MetricName
+	})
+
+	seriesFetchTimeouts := report.SeriesFetchFailureCounts(seriesFetchFailures)[report.SeriesFailureTimeout]
 	if len(seriesFetchFailures) > 0 {
-		warnings = append(warnings, fmt.Sprintf(
-			"%d metric name(s) skipped because Coralogix refused to analyze that many series in one query — see series_fetch_failures for the list. These metrics are excluded from used/unused classification and the OTEL fragment; their usage status is unknown, not unused.",
-			len(seriesFetchFailures),
-		))
+		// Too much of the catalog missing means the remainder can't support "unused" claims.
+		if float64(len(seriesFetchFailures)) > maxSeriesFetchFailureFraction*float64(len(metricNames)) {
+			return nil, fmt.Errorf(
+				"series fetch failed for %d of %d metric names (%s) — too much of the catalog is missing to report on; first failure: %s",
+				len(seriesFetchFailures), len(metricNames),
+				report.SeriesFetchFailureBreakdown(seriesFetchFailures),
+				seriesFetchFailures[0].MetricName,
+			)
+		}
+		warnings.Add(
+			"%d of %d metric name(s) skipped because their series catalog could not be retrieved (%s) — see series_fetch_failures for the list and per-metric reasons. These metrics are excluded from used/unused classification and the OTEL fragment; their usage status is unknown, not unused.",
+			len(seriesFetchFailures), len(metricNames), report.SeriesFetchFailureBreakdown(seriesFetchFailures),
+		)
 	}
 
 	setStatus("correlating selectors with catalog…")
@@ -345,11 +386,15 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 	billingInclusiveDays := opt.UsageLookbackDays
 	billingCalMonths := opt.UsageBillingCalendarMonths
 
+	billingAttempted, billingSucceeded := 0, 0
 	billingEnabled := opt.Billing != nil && (opt.UsageLookbackDays > 0 || opt.UsageBillingCalendarMonths > 0)
+	if !billingEnabled {
+		warnings.Add("CX billing data not collected (--billing off): no unit_usage, bytes_volume or sample_count figures anywhere in this report, and no cost-ranked outputs. Which series are unused is unaffected — only their cost is unknown.")
+	}
 	if billingEnabled {
 		startDay, endDay, inclDays, winErr := billingWindowUTC(time.Now(), opt.UsageLookbackDays, opt.UsageBillingCalendarMonths)
 		if winErr != nil {
-			warnings = append(warnings, "billing window: "+winErr.Error())
+			warnings.Add("billing window: %s", winErr.Error())
 		} else {
 			billingStartStr = startDay.Format("2006-01-02")
 			billingEndStr = endDay.Format("2006-01-02")
@@ -359,20 +404,51 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 			} else {
 				setStatus(fmt.Sprintf("fetching CX unit usage (%d UTC days)…", billingInclusiveDays))
 			}
-			raw, splitCounts, perMetricWarnings, err := opt.Billing.EnrichCatalog(ctx, catalogSeries, metricNames, startDay, endDay, opt.Workers, func(done, total int, metric string) {
+			enriched, err := opt.Billing.EnrichCatalog(ctx, catalogSeries, metricNames, startDay, endDay, opt.Workers, func(done, total int, metric string) {
 				setBar("billing", done, total, truncate(metric, 40))
 			})
-			for _, w := range perMetricWarnings {
-				warnings = append(warnings, "billing units: "+w)
-			}
 			if err != nil {
-				warnings = append(warnings, "billing units: "+err.Error())
+				warnings.Add("billing units: %s", err.Error())
 			} else {
-				for k, u := range raw {
+				// One warning per failed metric would repeat the same message thousands of times
+				// when the cause is the connection rather than the metric; AddFor folds them.
+				for _, f := range enriched.Failures {
+					warnings.AddFor("billing lookup failed", "metric", f.MetricName, f.Err.Error())
+				}
+				for k, u := range enriched.BySeries {
 					billingBySeries[k] = toReportBilling(u)
 				}
-				billingSplitBySeries = splitCounts
+				billingSplitBySeries = enriched.SplitCount
+				billingAttempted = enriched.Attempted
+				billingSucceeded = enriched.Succeeded()
 			}
+		}
+	}
+
+	// Coverage decides whether cost figures are reported at all: a metric whose lookup failed
+	// contributes no usage and so looks free, which drags every cost ranking downward.
+	billingPartialAccepted := false
+	if billingEnabled {
+		coverage := 1.0
+		if billingAttempted > 0 {
+			coverage = float64(billingSucceeded) / float64(billingAttempted)
+		}
+		switch {
+		case len(billingBySeries) == 0:
+			warnings.Add("CX billing was requested but returned no usable data: no unit_usage, bytes_volume or sample_count figures anywhere in this report, and no cost-ranked outputs. Cost figures are missing, not zero. Which series are unused is unaffected.")
+		case coverage >= report.BillingCoverageThreshold:
+			// Complete enough to report as fact; nothing to warn about.
+		case opt.BillingAllowPartial:
+			billingPartialAccepted = true
+			warnings.Add(
+				"CX billing covered only %.0f%% of metric lookups (%d of %d) — reported anyway because --billing-allow-partial was given. Every cost figure here is a LOWER BOUND: metrics whose lookup failed contribute nothing and appear free, so cost rankings are biased toward them.",
+				coverage*100, billingSucceeded, billingAttempted,
+			)
+		default:
+			warnings.Add(
+				"CX billing covered only %.0f%% of metric lookups (%d of %d), below the %.0f%% needed to report cost. Cost figures and the cost-ranked outputs are withheld rather than shown understated — the metrics whose lookups failed would appear free. Re-run to retry, or pass --billing-allow-partial to accept the partial figures as a lower bound. Which series are unused is unaffected.",
+				coverage*100, billingSucceeded, billingAttempted, report.BillingCoverageThreshold*100,
+			)
 		}
 	}
 
@@ -439,8 +515,13 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 			UsageBillingUTCEndDate:              billingEndStr,
 			UsageBillingCalendarMonths:          billingCalMonths,
 			SeriesWithBillingData:               len(billingBySeries),
+			BillingMetricLookupsAttempted:       billingAttempted,
+			BillingMetricLookupsSucceeded:       billingSucceeded,
+			BillingPartialAccepted:              billingPartialAccepted,
 			UnusedSeriesWithBilling:             unusedWithBilling,
 			SeriesFetchFailuresCount:            len(seriesFetchFailures),
+			SeriesFetchTimeoutsCount:            seriesFetchTimeouts,
+			DistinctLabelStringsRetained:        labelStringsRetained,
 		},
 		Dashboards:                           dashboards,
 		UsedSeriesInCatalog:                  used,
@@ -448,10 +529,72 @@ func Run(ctx context.Context, client Source, opt Options) (*report.Report, error
 		ReferencedSelectorsWithoutMetricName: noMetricName,
 		ReferencedSelectorsMetricAbsentInTimeseriesWindow:  metricAbsent,
 		ReferencedSelectorsMetricPresentButNoSeriesMatches: noLabelMatch,
-		SeriesFetchFailures:                                seriesFetchFailures,
-		Warnings:                                           warnings,
-		BillingSplitCountBySeries:                          billingSplitBySeries,
+		SeriesFetchFailures:       seriesFetchFailures,
+		Warnings:                  warnings.List(),
+		BillingSplitCountBySeries: billingSplitBySeries,
 	}, nil
+}
+
+// maxSeriesFetchFailureFraction bounds how much of the catalog may be missing before the scan
+// refuses to report at all. Individual metrics failing is normal (huge metrics break the series
+// endpoint); most of them failing means something systemic — a rate limit, an outage — and a
+// report built from the remainder would call metrics unused on no evidence.
+const maxSeriesFetchFailureFraction = 0.5
+
+// classifySeriesFetchFailure decides whether a /api/v1/series failure for one metric can be
+// noted and skipped (skip=true) or must fail the whole scan. Skipping is the default: the
+// endpoint fails in several metric-specific ways (the series-analysis cap, timeouts, and 5xx
+// on metrics it cannot enumerate), and one bad metric must not throw away the scan. Only
+// statuses that say the request itself was unacceptable — bad key, missing permission, bad
+// path — abort, since those would fail identically for every metric and would otherwise
+// produce a report claiming the whole estate is unused. Run-wide safety net: the caller also
+// aborts if too large a fraction of metrics failed (see maxSeriesFetchFailureFraction).
+func classifySeriesFetchFailure(metricName string, err error) (report.MetricSeriesFetchFailure, bool) {
+	failure := report.MetricSeriesFetchFailure{MetricName: metricName}
+
+	var limitErr *coralogix.SeriesAnalysisLimitError
+	if errors.As(err, &limitErr) {
+		failure.Category = report.SeriesFailureAnalysisCap
+		failure.Reason = "Coralogix rejected /api/v1/series with ViolationTypeTotalSeriesAnalyzed — this metric has more time series in the lookback window than the server will analyze in one query. Reduce --series-lookback-hours or treat this metric as unanalyzable."
+		return failure, true
+	}
+
+	var timeoutErr *coralogix.SeriesTimeoutError
+	if errors.As(err, &timeoutErr) {
+		failure.Category = report.SeriesFailureTimeout
+		failure.Reason = fmt.Sprintf("the /api/v1/series query for this metric did not complete before the request timeout — usually a metric with a very large number of series (%s). Raise --timeout-sec, reduce --series-lookback-hours, or treat this metric as unanalyzable.", firstLine(timeoutErr.Cause))
+		return failure, true
+	}
+
+	var statusErr *coralogix.HTTPStatusError
+	if errors.As(err, &statusErr) {
+		if isConfigLevelStatus(statusErr.Code) {
+			return report.MetricSeriesFetchFailure{}, false
+		}
+		failure.Category = report.SeriesFailureServerError
+		failure.Reason = fmt.Sprintf("Coralogix answered the /api/v1/series query for this metric with %s — commonly what the series endpoint does for a metric it cannot enumerate in the requested window. Reduce --series-lookback-hours to retry it, or treat this metric as unanalyzable.", statusErr.Status)
+		return failure, true
+	}
+
+	failure.Category = report.SeriesFailureTransport
+	failure.Reason = fmt.Sprintf("the /api/v1/series query for this metric failed: %s. The metric is excluded from the scan; everything else was scanned normally.", firstLine(err))
+	return failure, true
+}
+
+// isConfigLevelStatus reports whether an HTTP status means the request was rejected on its own
+// terms (credentials, permissions, URL, query syntax) rather than the server struggling with
+// one metric. These are identical for every metric, so the scan aborts instead of skipping.
+func isConfigLevelStatus(code int) bool {
+	switch code {
+	case http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusPaymentRequired,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusMethodNotAllowed:
+		return true
+	}
+	return false
 }
 
 func truncate(s string, max int) string {
@@ -459,6 +602,15 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max-1] + "…"
+}
+
+// firstLine reduces an error to its leading line — client errors carry a multi-line curl
+// replication block that would otherwise bloat every failure Reason in the report.
+func firstLine(err error) string {
+	if err == nil {
+		return ""
+	}
+	return firstLineOf(err.Error())
 }
 
 // omitCoralogixInternalMetricNames drops Coralogix-internal "__name__" values (prefix "cx_") before we
